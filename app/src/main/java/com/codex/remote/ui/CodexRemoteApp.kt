@@ -73,6 +73,7 @@ fun CodexRemoteApp(viewModel: AppViewModel) {
             onStartLogin = viewModel::startRemoteLogin,
             onCancelLogin = viewModel::cancelRemoteLogin,
             onApproval = viewModel::respondToApproval,
+            onDisconnect = viewModel::disconnect,
             onTrustHostKey = viewModel::trustPendingHostKey,
             onRejectHostKey = viewModel::rejectPendingHostKey,
             onDismissNotice = viewModel::clearNotice,

@@ -69,6 +69,17 @@ class ThreadHistoryPaginationTest {
         val timeline = CodexRpcClient.parseTurnsTimeline(turns)
 
         assertEquals(listOf("old", "new"), timeline.map { it.id })
+        assertEquals(listOf("turn-old", "turn-new"), timeline.map { it.turnId })
+    }
+
+    @Test
+    fun reusedItemIdsInDifferentTurnsRemainDistinct() {
+        val older = TimelineItem("same-item", TimelineKind.FILE_CHANGE, turnId = "turn-old")
+        val newer = TimelineItem("same-item", TimelineKind.FILE_CHANGE, turnId = "turn-new")
+
+        val merged = mergeTimelineHistory(listOf(older), listOf(newer))
+
+        assertEquals(listOf("turn-old", "turn-new"), merged.map { it.turnId })
     }
 
     @Test

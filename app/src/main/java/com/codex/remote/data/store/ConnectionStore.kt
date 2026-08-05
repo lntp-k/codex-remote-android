@@ -40,10 +40,10 @@ class ConnectionStore(
 
     suspend fun save(draft: ConnectionDraft, original: SavedConnection? = null): SavedConnection {
         val port = draft.port.toIntOrNull()?.takeIf { it in 1..65535 }
-            ?: error("SSH 端口必须在 1 到 65535 之间")
-        require(draft.name.isNotBlank()) { "请输入连接名称" }
-        require(draft.host.isNotBlank()) { "请输入 SSH 主机" }
-        require(draft.username.isNotBlank()) { "请输入用户名" }
+            ?: error("SSH port must be between 1 and 65535")
+        require(draft.name.isNotBlank()) { "Enter a connection name" }
+        require(draft.host.isNotBlank()) { "Enter an SSH host" }
+        require(draft.username.isNotBlank()) { "Enter a username" }
 
         val saved = SavedConnection(
             id = draft.id ?: original?.id ?: UUID.randomUUID().toString(),
@@ -61,10 +61,10 @@ class ConnectionStore(
             lastUsedAt = original?.lastUsedAt ?: 0,
         )
         if (saved.authType == AuthType.PASSWORD && saved.encryptedPassword.isBlank()) {
-            error("请输入 SSH 密码")
+            error("Enter an SSH password")
         }
         if (saved.authType == AuthType.PRIVATE_KEY && saved.encryptedPrivateKey.isBlank()) {
-            error("请粘贴 OpenSSH 或 PEM 私钥")
+            error("Paste an OpenSSH or PEM private key")
         }
 
         update { current -> current.filterNot { it.id == saved.id } + saved }

@@ -105,13 +105,13 @@ fun ConnectionsScreen(
                 navigationIcon = {
                     if (state.activeConnection != null) {
                         IconButton(onClick = onBack) {
-                            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回工作区")
+                            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back to workspace")
                         }
                     }
                 },
                 actions = {
                     IconButton(onClick = onAdd) {
-                        Icon(Icons.Outlined.Add, contentDescription = "添加连接")
+                        Icon(Icons.Outlined.Add, contentDescription = "Add connection")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -149,7 +149,7 @@ fun ConnectionsScreen(
                             Icon(Icons.Outlined.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(10.dp))
                             Text(
-                                "凭据由 Android Keystore 加密。首次连接保存主机指纹，密钥变化时会阻止连接。",
+                                "Credentials are encrypted with Android Keystore. The first connection pins the host key; a changed key blocks future connections.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -172,15 +172,15 @@ fun ConnectionsScreen(
     pendingDelete?.let { connection ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("删除 ${connection.name}？") },
-            text = { Text("保存的主机和加密凭据将从此设备移除。") },
+            title = { Text("Delete ${connection.name}?") },
+            text = { Text("The saved host and encrypted credentials will be removed from this device.") },
             confirmButton = {
                 TextButton(onClick = {
                     pendingDelete = null
                     onDelete(connection)
-                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("取消") } },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Cancel") } },
         )
     }
 }
@@ -253,7 +253,7 @@ private fun ConnectionRow(
                         Spacer(Modifier.width(8.dp))
                         Icon(
                             Icons.Outlined.CheckCircle,
-                            contentDescription = "当前主机",
+                            contentDescription = "Current host",
                             modifier = Modifier.size(15.dp),
                             tint = MaterialTheme.colorScheme.secondary,
                         )
@@ -276,8 +276,8 @@ private fun ConnectionRow(
             } else {
                 TextButton(onClick = onConnect) { Text(if (isActive) "Reconnect" else "Connect") }
             }
-            IconButton(onClick = onEdit) { Icon(Icons.Outlined.Edit, contentDescription = "编辑") }
-            IconButton(onClick = onDelete) { Icon(Icons.Outlined.DeleteOutline, contentDescription = "删除") }
+            IconButton(onClick = onEdit) { Icon(Icons.Outlined.Edit, contentDescription = "Edit") }
+            IconButton(onClick = onDelete) { Icon(Icons.Outlined.DeleteOutline, contentDescription = "Delete") }
         }
     }
 }
@@ -311,13 +311,16 @@ private fun ConnectionEditor(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     IconButton(onClick = onDismiss, enabled = !busy) {
-                        Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "关闭")
+                        Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Close")
                     }
                     Text(
                         if (original == null) "Add SSH host" else "Edit SSH host",
                         style = MaterialTheme.typography.titleLarge,
                         modifier = Modifier.weight(1f),
                     )
+                    TextButton(onClick = { submit(true) }, enabled = !busy) {
+                        Text("Connect")
+                    }
                     if (busy) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                 }
                 HorizontalDivider()

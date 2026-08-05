@@ -12,7 +12,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -31,6 +33,13 @@ import com.codex.remote.data.rpc.CodexRpcClient
 import com.codex.remote.data.store.ConnectionStore
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.AuthType
+import com.codex.remote.domain.ApprovalContextField
+import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalOption
+import com.codex.remote.domain.ApprovalQuestion
+import com.codex.remote.domain.ApprovalQueue
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.ApprovalRequest
 import com.codex.remote.domain.ComposerImageAttachment
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.FileChangeSummary
@@ -46,6 +55,7 @@ import com.codex.remote.domain.RemoteSkill
 import com.codex.remote.domain.RemoteThread
 import com.codex.remote.domain.RemoteThreadTokenUsage
 import com.codex.remote.domain.ReviewTargetKind
+import com.codex.remote.domain.RpcRequestId
 import com.codex.remote.domain.SavedConnection
 import com.codex.remote.domain.ThreadGoal
 import com.codex.remote.domain.ThreadGoalStatus
@@ -81,8 +91,8 @@ class WorkspaceDeviceTest {
 
         composeRule.onAllNodesWithText("Default", substring = true).assertCountEquals(0)
         composeRule.onAllNodesWithText("Plan", substring = true).assertCountEquals(0)
-        composeRule.onNodeWithText("5.6-sol · 极高 · Fast").assertExists()
-        composeRule.onNodeWithTag(COMPOSER_CONTEXT).assertContentDescriptionEquals("上下文已使用 64%")
+        composeRule.onNodeWithText("5.6-sol · Ultra · Fast").assertExists()
+        composeRule.onNodeWithTag(COMPOSER_CONTEXT).assertContentDescriptionEquals("Context 64% used")
 
         val add = composeRule.onNodeWithTag(COMPOSER_ADD).fetchSemanticsNode().boundsInRoot
         val permissions = composeRule.onNodeWithTag(COMPOSER_PERMISSIONS).fetchSemanticsNode().boundsInRoot
@@ -95,7 +105,7 @@ class WorkspaceDeviceTest {
         assertTrue(model.center.x < send.center.x)
 
         composeRule.onNodeWithTag(COMPOSER_PERMISSIONS).performClick()
-        composeRule.onNodeWithText("替我审批").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Auto review").assertIsDisplayed().performClick()
         composeRule.runOnIdle { assertEquals(PermissionMode.AUTO_REVIEW, callbacks.permissionMode) }
 
         composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput("/plan")
@@ -131,7 +141,7 @@ class WorkspaceDeviceTest {
         scrollTo("timeline-tool-body-reasoning")
         composeRule.onNodeWithText("private reasoning").assertIsDisplayed()
         scrollTo("timeline-tool-body-command-group:cmd-1")
-        composeRule.onNodeWithText("运行了多个命令").assertExists()
+        composeRule.onNodeWithText("Ran multiple commands").assertExists()
         composeRule.onNodeWithText("/workspace/demo", substring = true).assertExists()
         scrollTo("timeline-tool-body-tool")
         composeRule.onNodeWithText("tool details").assertIsDisplayed()
@@ -277,7 +287,7 @@ val answer = 42
         show(state)
         composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput("draft-a")
         composeRule.onNodeWithTag(COMPOSER_ADD).performClick()
-        composeRule.onNodeWithText("目标").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Goal").assertIsDisplayed().performClick()
         composeRule.onNodeWithTag(COMPOSER_GOAL_MARKER).assertExists()
 
         composeRule.runOnIdle {
@@ -315,13 +325,13 @@ val answer = 42
         show(state, callbacks)
 
         composeRule.onNodeWithTag(COMPOSER_ADD).performClick()
-        composeRule.onNodeWithText("目标").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Goal").assertIsDisplayed().performClick()
         composeRule.onAllNodesWithText("Unsupported method", substring = true).assertCountEquals(0)
         composeRule.onNodeWithTag(COMPOSER_GOAL_MARKER).assertIsDisplayed().performClick()
         composeRule.onAllNodesWithTag(COMPOSER_GOAL_MARKER).assertCountEquals(0)
 
         composeRule.onNodeWithTag(COMPOSER_ADD).performClick()
-        composeRule.onNodeWithText("目标").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Goal").assertIsDisplayed().performClick()
         composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput("ship-device-tests")
         composeRule.onNodeWithTag(COMPOSER_SEND).performClick()
         composeRule.runOnIdle {
@@ -330,9 +340,9 @@ val answer = 42
         composeRule.onAllNodesWithTag(COMPOSER_GOAL_MARKER).assertCountEquals(0)
 
         composeRule.onNodeWithTag(COMPOSER_ADD).performClick()
-        composeRule.onNodeWithText("目标").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Goal").assertIsDisplayed().performClick()
         composeRule.onNodeWithTag(COMPOSER_ADD).performClick()
-        composeRule.onNodeWithText("计划模式").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Plan mode").assertIsDisplayed().performClick()
         assertEquals("plan", callbacks.collaborationMode)
         composeRule.onAllNodesWithTag(COMPOSER_GOAL_MARKER).assertCountEquals(0)
 
@@ -385,7 +395,7 @@ val answer = 42
         show(state, callbacks)
 
         composeRule.onNodeWithTag(COMPOSER_ADD).performClick()
-        composeRule.onNodeWithText("目标").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Goal").assertIsDisplayed().performClick()
         composeRule.onNodeWithTag(COMPOSER_GOAL_MARKER).assertIsDisplayed()
         composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput("create-thread-with-goal")
         composeRule.onNodeWithTag(COMPOSER_SEND).performClick()
@@ -393,7 +403,7 @@ val answer = 42
         composeRule.runOnIdle {
             assertEquals(listOf("create-thread-with-goal" to true), callbacks.sentMessages)
         }
-        composeRule.onAllNodesWithText("请先发送第一条消息", substring = true).assertCountEquals(0)
+        composeRule.onAllNodesWithText("Send the first message", substring = true).assertCountEquals(0)
         composeRule.onAllNodesWithTag(COMPOSER_GOAL_MARKER).assertCountEquals(0)
     }
 
@@ -410,7 +420,7 @@ val answer = 42
         show(state)
 
         composeRule.onNodeWithTag("timeline-goal-goal-message").assertExists()
-        composeRule.onNodeWithText("作为目标发送").assertExists()
+        composeRule.onNodeWithText("Sent as goal").assertExists()
         composeRule.onAllNodesWithTag("timeline-goal-normal-message").assertCountEquals(0)
     }
 
@@ -427,9 +437,9 @@ val answer = 42
         )
         show(mutableStateOf(baseState(timeline = listOf(files))))
 
-        composeRule.onNodeWithText("已编辑 2 个文件").assertIsDisplayed()
+        composeRule.onNodeWithText("Edited 2 files").assertIsDisplayed()
         composeRule.onNodeWithText("--- a/app/src/Main.kt").assertDoesNotExist()
-        composeRule.onNodeWithText("已编辑 2 个文件").performClick()
+        composeRule.onNodeWithText("Edited 2 files").performClick()
         composeRule.onNodeWithText("app/src/Main.kt").assertExists()
         composeRule.onNodeWithText("app/src/Status.kt").assertExists()
         composeRule.onNodeWithText("Modified").assertExists()
@@ -437,6 +447,305 @@ val answer = 42
         composeRule.onNodeWithText("+2  -1").assertExists()
         composeRule.onAllNodesWithText("Changes").assertCountEquals(0)
         composeRule.onAllNodesWithText("{\"changes\"", substring = true).assertCountEquals(0)
+    }
+
+    @Test
+    fun fileChangeTimelineBoundsAnOversizedTargetLabel() {
+        val fullPath = "p".repeat(4_097)
+        val boundedPath = "p".repeat(4_096)
+        val files = TimelineItem(
+            id = "bounded-target-label",
+            kind = TimelineKind.FILE_CHANGE,
+            fileChanges = listOf(FileChangeSummary(fullPath, "update", "+safe")),
+        )
+        show(mutableStateOf(baseState(timeline = listOf(files))))
+
+        composeRule.onNodeWithText(fullPath).assertDoesNotExist()
+        composeRule.onNodeWithText(boundedPath).assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("File target label truncated for safety.").assertIsDisplayed()
+    }
+
+    @Test
+    fun approvalDialogReturnsTheRenderedRequestIdWhileAnotherRequestIsQueued() {
+        val first = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-visible"),
+            kind = ApprovalKind.COMMAND,
+            title = "Allow command?",
+            detail = "git status --short",
+            rawMethod = "item/commandExecution/requestApproval",
+            cwd = "/workspace/secure-command",
+            context = listOf(
+                ApprovalContextField("Working directory", "/workspace/secure-command"),
+                ApprovalContextField("Additional permissions", "{\"network\":{\"enabled\":true}}"),
+            ),
+            availableDecisions = listOf("accept", "decline"),
+        )
+        val second = first.copy(
+            requestId = RpcRequestId.Text("request-later"),
+            detail = "rm -rf build",
+        )
+        val queue = ApprovalQueue().enqueue(first).enqueue(second)
+        val visibleKey = queue.currentEntry!!.key
+        val state = mutableStateOf(baseState().copy(approvalQueue = queue))
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+
+        composeRule.onNodeWithText("git status --short").assertIsDisplayed()
+        composeRule.onNodeWithText("Working directory").assertIsDisplayed()
+        composeRule.onNodeWithText("/workspace/secure-command").assertIsDisplayed()
+        composeRule.onNodeWithText("{\"network\":{\"enabled\":true}}", substring = true).assertIsDisplayed()
+        composeRule.onAllNodesWithText("Allow session").assertCountEquals(0)
+        composeRule.onNodeWithText("Allow once").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(visibleKey, callbacks.approval?.first)
+            assertEquals(RpcRequestId.Text("request-visible"), callbacks.approval?.first?.requestId)
+            assertEquals("accept", callbacks.approval?.second)
+        }
+    }
+
+    @Test
+    fun userInputApprovalShowsOptionContextAndReturnsEveryRenderedAnswer() {
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-user-input"),
+            kind = ApprovalKind.USER_INPUT,
+            title = "Codex needs your input",
+            detail = "Choose how to continue",
+            rawMethod = "item/tool/requestUserInput",
+            questions = listOf(
+                ApprovalQuestion(
+                    id = "mode",
+                    header = "Mode",
+                    question = "Choose a mode",
+                    options = listOf(
+                        ApprovalOption("Safe", "Keep approval prompts enabled"),
+                        ApprovalOption("Fast", "Use the current defaults"),
+                    ),
+                ),
+                ApprovalQuestion(
+                    id = "note",
+                    header = "Note",
+                    question = "Add context",
+                ),
+                ApprovalQuestion(
+                    id = "other",
+                    header = "Alternative",
+                    question = "Choose the default or type another answer",
+                    isOther = true,
+                    options = listOf(ApprovalOption("Default", "Use the listed default")),
+                ),
+            ),
+            threadId = "thread-a",
+            turnId = "turn-a",
+            itemId = "input-a",
+            availableDecisions = listOf("accept"),
+        )
+        val queue = ApprovalQueue().enqueue(request)
+        val requestKey = queue.currentEntry!!.key
+        val callbacks = WorkspaceCallbacks()
+        show(mutableStateOf(baseState().copy(approvalQueue = queue)), callbacks)
+
+        composeRule.onNodeWithText("Keep approval prompts enabled").assertIsDisplayed()
+        composeRule.onNodeWithText("Use the current defaults").assertIsDisplayed()
+        composeRule.onNodeWithText("Send").assertIsNotEnabled()
+        composeRule.onNodeWithText("Fast").performClick()
+        composeRule.onNodeWithText("Response").performScrollTo().performTextInput("Proceed carefully")
+        composeRule.onNodeWithText("Other response").performScrollTo().performTextInput("Custom path")
+        composeRule.onNodeWithText("Send").assertIsEnabled().performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(requestKey, callbacks.approval?.first)
+            assertEquals("accept", callbacks.approval?.second)
+            assertEquals(
+                mapOf(
+                    "mode" to listOf("Fast"),
+                    "note" to listOf("Proceed carefully"),
+                    "other" to listOf("Custom path"),
+                ),
+                callbacks.approval?.third,
+            )
+        }
+    }
+
+    @Test
+    fun fileApprovalStaysDenyOnlyUntilTheMatchingTimelineItemArrives() {
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Number(71),
+            kind = ApprovalKind.FILE_CHANGE,
+            title = "Allow file changes?",
+            detail = "Apply release patch",
+            rawMethod = "item/fileChange/requestApproval",
+            threadId = "thread-a",
+            turnId = "turn-a",
+            itemId = "patch-a",
+            availableDecisions = listOf("accept", "acceptForSession", "decline"),
+        )
+        val state = mutableStateOf(
+            baseState().copy(approvalQueue = ApprovalQueue().enqueue(request)),
+        )
+        show(state)
+
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("File targets have not arrived yet.").assertIsDisplayed()
+
+        composeRule.runOnIdle {
+            val timeline = listOf(
+                TimelineItem(
+                    id = "patch-a",
+                    kind = TimelineKind.FILE_CHANGE,
+                    turnId = "turn-a",
+                    fileChanges = listOf(
+                        FileChangeSummary("app/src/Main.kt", "update", "-old\n+new"),
+                    ),
+                ),
+            )
+            state.value = state.value.copy(
+                timeline = timeline,
+                approvalQueue = state.value.approvalQueue.bindFileChangeSnapshots(
+                    timeline,
+                    "thread-a",
+                ),
+            )
+        }
+        composeRule.onNodeWithText("Allow once").assertIsEnabled()
+        composeRule.onNodeWithText("app/src/Main.kt").assertIsDisplayed()
+        composeRule.onNodeWithText("+new").assertExists()
+    }
+
+    @Test
+    fun approvalDialogAlwaysOffersSafeDisconnectWhenNoDecisionCanBeSent() {
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-no-safe-decision"),
+            kind = ApprovalKind.COMMAND,
+            title = "Malformed approval",
+            detail = "Hidden command context",
+            rawMethod = "item/commandExecution/requestApproval",
+            availableDecisions = emptyList(),
+            securityContextComplete = false,
+        )
+        val callbacks = WorkspaceCallbacks()
+        show(
+            mutableStateOf(baseState().copy(approvalQueue = ApprovalQueue().enqueue(request))),
+            callbacks,
+        )
+
+        composeRule.onNodeWithText("Disconnect").assertIsDisplayed().performClick()
+
+        composeRule.runOnIdle { assertEquals(1, callbacks.disconnects) }
+    }
+
+    @Test
+    fun fileApprovalShowsTheFullPathAndBoundsItsDiffPreview() {
+        val fullPath = "app/src/main/java/com/example/very/long/security/sensitive/GeneratedReleaseConfiguration.kt"
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-large-diff"),
+            kind = ApprovalKind.FILE_CHANGE,
+            title = "Allow file changes?",
+            detail = "Apply generated release patch",
+            rawMethod = "item/fileChange/requestApproval",
+            threadId = "thread-a",
+            turnId = "turn-a",
+            itemId = "patch-large",
+            availableDecisions = listOf("accept", "decline"),
+        )
+        val item = TimelineItem(
+            id = "patch-large",
+            kind = TimelineKind.FILE_CHANGE,
+            turnId = "turn-a",
+            fileChanges = listOf(
+                FileChangeSummary(
+                    fullPath,
+                    "update",
+                    (1..260).joinToString("\n") { line -> "+sensitive-$line" },
+                ),
+            ),
+        )
+        show(
+            mutableStateOf(
+                baseState(timeline = listOf(item)).copy(
+                    approvalQueue = ApprovalQueue().enqueue(request).bindFileChangeSnapshots(
+                        listOf(item),
+                        "thread-a",
+                    ),
+                ),
+            ),
+        )
+
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText(fullPath).assertExists()
+        composeRule.onNodeWithText("Diff preview truncated for safety.").assertExists()
+    }
+
+    @Test
+    fun fileApprovalDisablesAllowWhenAFileTargetIsHiddenByTheSafetyBudget() {
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-many-targets"),
+            kind = ApprovalKind.FILE_CHANGE,
+            title = "Allow many file changes?",
+            detail = "Apply generated changes",
+            rawMethod = "item/fileChange/requestApproval",
+            threadId = "thread-a",
+            turnId = "turn-a",
+            itemId = "patch-many",
+            availableDecisions = listOf("accept", "acceptForSession", "decline"),
+        )
+        val item = TimelineItem(
+            id = "patch-many",
+            kind = TimelineKind.FILE_CHANGE,
+            turnId = "turn-a",
+            fileChanges = (1..201).map { index ->
+                FileChangeSummary("app/generated/File$index.kt", "update", "+value-$index")
+            },
+        )
+        show(
+            mutableStateOf(
+                baseState(timeline = listOf(item)).copy(
+                    approvalQueue = ApprovalQueue().enqueue(request).bindFileChangeSnapshots(
+                        listOf(item),
+                        "thread-a",
+                    ),
+                ),
+            ),
+        )
+
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("Allow session").assertIsNotEnabled()
+        composeRule.onNodeWithText("additional file target hidden", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("app/generated/File201.kt").assertDoesNotExist()
+    }
+
+    @Test
+    fun fileApprovalDisablesAllowWhenATargetLabelIsTruncated() {
+        val fullPath = "p".repeat(4_097)
+        val boundedPath = "p".repeat(4_096)
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-long-target"),
+            kind = ApprovalKind.FILE_CHANGE,
+            title = "Allow long file target?",
+            detail = "Apply generated changes",
+            rawMethod = "item/fileChange/requestApproval",
+            threadId = "thread-a",
+            turnId = "turn-a",
+            itemId = "patch-long-target",
+            availableDecisions = listOf("accept", "decline"),
+        )
+        val item = TimelineItem(
+            id = "patch-long-target",
+            kind = TimelineKind.FILE_CHANGE,
+            turnId = "turn-a",
+            fileChanges = listOf(FileChangeSummary(fullPath, "update", "+safe")),
+        )
+        val queue = ApprovalQueue().enqueue(request).bindFileChangeSnapshots(listOf(item), "thread-a")
+        show(
+            mutableStateOf(
+                baseState(timeline = listOf(item)).copy(approvalQueue = queue),
+            ),
+        )
+
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText(fullPath).assertDoesNotExist()
+        composeRule.onNodeWithText(boundedPath).assertExists()
+        composeRule.onNodeWithText("File target label truncated for safety.").assertExists()
     }
 
     private fun scrollTo(tag: String) {
@@ -491,7 +800,8 @@ val answer = 42
                     onClearRemoteDirectory = {},
                     onStartLogin = {},
                     onCancelLogin = {},
-                    onApproval = { _, _ -> },
+                    onApproval = callbacks.onApproval,
+                    onDisconnect = callbacks.onDisconnect,
                     onTrustHostKey = {},
                     onRejectHostKey = {},
                     onDismissNotice = {},
@@ -575,8 +885,13 @@ private class WorkspaceCallbacks {
     var permissionMode: PermissionMode? = null
     val sentMessages = mutableListOf<Pair<String, Boolean>>()
     var olderLoads: Int = 0
+    var disconnects: Int = 0
+    var approval: Triple<ApprovalQueueKey, String, Map<String, List<String>>>? = null
     var onLoadOlder: () -> Unit = {}
     var onSetGoal: (String) -> Unit = {}
+    var onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit =
+        { requestKey, decision, answers -> approval = Triple(requestKey, decision, answers) }
+    var onDisconnect: () -> Unit = { disconnects += 1 }
     var onSend: (String, List<ComposerMention>, List<ComposerImageAttachment>, Boolean) -> Unit =
         { text, _, _, asGoal -> sentMessages += text.trim() to asGoal }
 }
