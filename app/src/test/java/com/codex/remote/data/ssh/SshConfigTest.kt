@@ -1,12 +1,26 @@
 package com.codex.remote.data.ssh
 
 import com.codex.remote.domain.RemotePlatform
+import net.schmizz.sshj.SSHClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SshConfigTest {
+    @Test
+    fun configuresProtocolKeepAliveEveryThirtySeconds() {
+        val ssh = SSHClient(androidCompatibleSshConfig())
+
+        try {
+            configureProtocolKeepAlive(ssh)
+
+            assertEquals(30, ssh.connection.keepAlive.keepAliveInterval)
+        } finally {
+            runCatching { ssh.close() }
+        }
+    }
+
     @Test
     fun excludesCurve25519ThatAndroidCannotInstantiate() {
         val names = androidCompatibleSshConfig().keyExchangeFactories.map { it.name }

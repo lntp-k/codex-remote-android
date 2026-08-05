@@ -22,16 +22,27 @@ import java.security.MessageDigest
 import java.security.PublicKey
 import java.util.Base64
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class HostKeyChangedException(
     expected: String,
     actual: String,
-) : SecurityException("SSH 主机密钥已变更。已保存 $expected，当前为 $actual")
+) : SecurityException("SSH host key changed. Saved: $expected; received: $actual.")
 
 class UnknownHostKeyException(val fingerprint: String) :
-    SecurityException("首次连接需要确认 SSH 主机指纹：$fingerprint")
+    SecurityException("Confirm the SSH host fingerprint before connecting: $fingerprint")
 
 class RemoteCodexUnavailableException(message: String) : IllegalStateException(message)
+
+internal class TransportAbortPlan(
+    private val blockOutbound: List<() -> Unit>,
+    private val cleanupStreams: List<() -> Unit>,
+) {
+    fun run() {
+        blockOutbound.forEach { action -> runCatching(action) }
+        cleanupStreams.forEach { action -> runCatching(action) }
+    }
+}
 
 class ActiveSshTransport internal constructor(
     private val ssh: SSHClient,
@@ -41,11 +52,40 @@ class ActiveSshTransport internal constructor(
     val remotePlatform: RemotePlatform,
     val codexVersion: String,
 ) : Closeable {
-    val reader: BufferedReader = BufferedReader(InputStreamReader(command.inputStream, Charsets.UTF_8))
-    val writer: BufferedWriter = BufferedWriter(OutputStreamWriter(command.outputStream, Charsets.UTF_8))
-    val errorReader: BufferedReader = BufferedReader(InputStreamReader(command.errorStream, Charsets.UTF_8))
+    private val inbound = command.inputStream
+    private val outbound = command.outputStream
+    private val errorInbound = command.errorStream
+    private val aborted = AtomicBoolean(false)
+
+    val reader: BufferedReader = BufferedReader(InputStreamReader(inbound, Charsets.UTF_8))
+    val writer: BufferedWriter = BufferedWriter(OutputStreamWriter(outbound, Charsets.UTF_8))
+    val errorReader: BufferedReader = BufferedReader(InputStreamReader(errorInbound, Charsets.UTF_8))
+
+    private val abortPlan = TransportAbortPlan(
+        blockOutbound = listOf(
+            { outbound.close() },
+            { command.close() },
+            { session.close() },
+            { ssh.disconnect() },
+            { ssh.close() },
+        ),
+        cleanupStreams = listOf(
+            { reader.close() },
+            { errorReader.close() },
+            { writer.close() },
+        ),
+    )
+
+    fun abort() {
+        aborted.set(true)
+        abortPlan.run()
+    }
 
     override fun close() {
+        if (aborted.get()) {
+            abortPlan.run()
+            return
+        }
         runCatching { writer.close() }
         runCatching { command.close() }
         runCatching { session.close() }
@@ -122,6 +162,7 @@ class SshAppServerTransportFactory(private val context: Context) {
                 AuthType.PASSWORD -> ssh.authPassword(connection.username, secrets.password)
                 AuthType.PRIVATE_KEY -> authenticatePrivateKey(ssh, connection.username, secrets)
             }
+            configureProtocolKeepAlive(ssh)
             return ssh
         } catch (error: Throwable) {
             runCatching { ssh.disconnect() }
@@ -176,9 +217,9 @@ class SshAppServerTransportFactory(private val context: Context) {
         if (probe.exitStatus != 0 || version == null) {
             val detail = probe.stderr.lineSequence().lastOrNull { it.isNotBlank() }
                 ?: probe.stdout.lineSequence().lastOrNull { it.isNotBlank() }
-                ?: "codex --version 未返回版本"
+                ?: "codex --version returned no version"
             throw RemoteCodexUnavailableException(
-                "远端登录 shell 找不到可用的 Codex CLI。请先在远端运行 codex --version 并完成安装。$detail",
+                "No usable Codex CLI was found in the remote login shell. Run codex --version on the remote host and complete installation first. $detail",
             )
         }
         return version.substringAfter(' ').trim()
@@ -191,7 +232,7 @@ class SshAppServerTransportFactory(private val context: Context) {
             try {
                 command.join(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                 if (command.isOpen) {
-                    throw RemoteCodexUnavailableException("远端 Codex 预检超时")
+                    throw RemoteCodexUnavailableException("Remote Codex preflight timed out")
                 }
                 ProbeResult(
                     exitStatus = command.exitStatus ?: -1,
@@ -236,4 +277,8 @@ internal fun androidCompatibleSshConfig() = DefaultSecurityProviderConfig().appl
     keyExchangeFactories = keyExchangeFactories.filterNot {
         it.name.contains("curve25519", ignoreCase = true)
     }
+}
+
+internal fun configureProtocolKeepAlive(ssh: SSHClient) {
+    ssh.connection.keepAlive.keepAliveInterval = 30
 }

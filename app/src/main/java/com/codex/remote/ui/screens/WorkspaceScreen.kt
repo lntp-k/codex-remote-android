@@ -154,6 +154,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalQueueKey
+import com.codex.remote.domain.BoundedFileChangePreview
 import com.codex.remote.domain.ConnectionStatus
 import com.codex.remote.domain.ComposerMention
 import com.codex.remote.domain.ComposerMentionKind
@@ -170,6 +172,7 @@ import com.codex.remote.domain.TimelineItem
 import com.codex.remote.domain.TimelineKind
 import com.codex.remote.domain.ThreadGoal
 import com.codex.remote.domain.ThreadGoalStatus
+import com.codex.remote.domain.aggregateFileChangePreview
 import com.codex.remote.domain.composerToken
 import com.codex.remote.domain.findComposerTrigger
 import com.codex.remote.domain.replaceComposerTrigger
@@ -230,7 +233,8 @@ fun WorkspaceScreen(
     onClearRemoteDirectory: () -> Unit,
     onStartLogin: () -> Unit,
     onCancelLogin: () -> Unit,
-    onApproval: (String, Map<String, List<String>>) -> Unit,
+    onApproval: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit,
+    onDisconnect: () -> Unit,
     onTrustHostKey: () -> Unit,
     onRejectHostKey: () -> Unit,
     onDismissNotice: () -> Unit,
@@ -385,10 +389,17 @@ fun WorkspaceScreen(
         }
     }
 
-    state.pendingApproval?.let { approval ->
+    state.approvalQueue.currentEntry?.let { entry ->
+        val approval = entry.request
+        val fileChanges = approval.resolvedFileChanges(state.timeline, state.selectedThreadId)
         ApprovalDialog(
+            requestKey = entry.key,
             approval = approval,
+            fileChanges = fileChanges,
+            canApprove = approval.canApprove(state.timeline, state.selectedThreadId),
+            isResponding = entry.key in state.approvalQueue.respondingKeys,
             onDecision = onApproval,
+            onDisconnect = onDisconnect,
         )
     }
     state.pendingHostKeyFingerprint?.let { fingerprint ->
@@ -617,7 +628,7 @@ private fun WorkspaceSidebar(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Icon(Icons.Outlined.Settings, contentDescription = "连接设置", modifier = Modifier.size(18.dp))
+            Icon(Icons.Outlined.Settings, contentDescription = "Connection settings", modifier = Modifier.size(18.dp))
         }
         Spacer(Modifier.navigationBarsPadding())
     }
@@ -843,7 +854,7 @@ private fun WorkspaceContent(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (showMenu) {
-                            IconButton(onClick = onMenu) { Icon(Icons.Outlined.Menu, contentDescription = "打开会话") }
+                            IconButton(onClick = onMenu) { Icon(Icons.Outlined.Menu, contentDescription = "Open task list") }
                         }
                         Column(Modifier.weight(1f)) {
                             Text(
@@ -897,7 +908,8 @@ private fun WorkspaceContent(
                 state.models.isEmpty() -> ConnectionState(
                     icon = Icons.Outlined.ErrorOutline,
                     title = "No remote models",
-                    detail = "远端 app-server 没有返回可用模型。请检查远端 Codex 版本和模型提供方配置。",
+                    detail = "The remote app-server returned no available models. " +
+                        "Check the remote Codex version and model-provider configuration.",
                     loading = false,
                     modifier = Modifier.fillMaxSize().padding(padding),
                 )
@@ -1117,7 +1129,7 @@ internal fun groupConsecutiveCommands(timeline: List<TimelineItem>): List<Timeli
                     item = TimelineItem(
                         id = "command-group:${commands.first().id}",
                         kind = TimelineKind.COMMAND,
-                        title = "运行了多个命令",
+                        title = "Ran multiple commands",
                         body = body,
                         status = status,
                     ),
@@ -1183,7 +1195,7 @@ private fun Conversation(
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    if (state.isBusy) "正在加载最近消息" else project?.name ?: "No remote Codex history",
+                    if (state.isBusy) "Loading recent messages" else project?.name ?: "No remote Codex history",
                     style = MaterialTheme.typography.headlineSmall,
                 )
                 Spacer(Modifier.height(5.dp))
@@ -1197,7 +1209,7 @@ private fun Conversation(
                     TextButton(onClick = onLoadOlderHistory) {
                         Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
-                        Text("加载更早消息")
+                        Text("Load earlier messages")
                     }
                 }
             }
@@ -1365,17 +1377,17 @@ private fun Conversation(
                         state.olderHistoryError != null && state.hasOlderHistory -> TextButton(onClick = requestOlderHistory) {
                             Icon(Icons.Outlined.Refresh, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
-                            Text("重试加载更早消息", maxLines = 1)
+                            Text("Retry loading earlier messages", maxLines = 1)
                         }
                         state.olderHistoryError != null -> Text(
-                            "无法继续加载更早消息",
+                            "Could not load earlier messages",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                         )
                         state.hasOlderHistory -> TextButton(onClick = requestOlderHistory) {
                             Icon(Icons.Outlined.KeyboardArrowUp, contentDescription = null)
                             Spacer(Modifier.width(6.dp))
-                            Text("加载更早消息")
+                            Text("Load earlier messages")
                         }
                     }
                 }
@@ -1427,7 +1439,7 @@ private fun Conversation(
                 containerColor = MaterialTheme.colorScheme.surface,
                 contentColor = MaterialTheme.colorScheme.onSurface,
             ) {
-                Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = "回到最新消息")
+                Icon(Icons.Outlined.KeyboardArrowDown, contentDescription = "Jump to latest")
             }
         }
     }
@@ -1485,7 +1497,7 @@ private fun TimelineRow(item: TimelineItem, modifier: Modifier) {
                             )
                             Spacer(Modifier.width(5.dp))
                             Text(
-                                "作为目标发送",
+                                "Sent as goal",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1559,14 +1571,15 @@ private fun FileChangesTool(item: TimelineItem, modifier: Modifier) {
     LaunchedEffect(item.id, item.status) {
         expanded = item.status.isTimelineItemRunning()
     }
-    val counts = item.fileChanges.fold(0 to 0) { total, change ->
-        val changeCounts = diffLineCounts(change.diff)
+    val preview = aggregateFileChangePreview(item.fileChanges)
+    val counts = preview.files.fold(0 to 0) { total, file ->
+        val changeCounts = diffLineCounts(file.diff)
         total.first + changeCounts.first to total.second + changeCounts.second
     }
     val title = when (item.fileChanges.size) {
         0 -> item.title.ifBlank { "File changes" }
-        1 -> item.fileChanges.first().path
-        else -> "已编辑 ${item.fileChanges.size} 个文件"
+        1 -> preview.files.first().path
+        else -> "Edited ${item.fileChanges.size} files"
     }
     Surface(
         modifier = modifier.animateContentSize().testTag("file-changes-${item.id}"),
@@ -1598,7 +1611,7 @@ private fun FileChangesTool(item: TimelineItem, modifier: Modifier) {
                 }
                 Icon(
                     if (expanded) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight,
-                    contentDescription = if (expanded) "收起文件修改" else "展开文件修改",
+                    contentDescription = if (expanded) "Collapse file changes" else "Expand file changes",
                     modifier = Modifier.size(18.dp),
                 )
             }
@@ -1611,9 +1624,18 @@ private fun FileChangesTool(item: TimelineItem, modifier: Modifier) {
                         style = MonoText,
                     )
                 } else {
-                    item.fileChanges.forEachIndexed { index, change ->
-                        FileChangeBlock(change)
-                        if (index != item.fileChanges.lastIndex) HorizontalDivider()
+                    preview.files.forEachIndexed { index, file ->
+                        FileChangeBlock(file)
+                        if (index != preview.files.lastIndex) HorizontalDivider()
+                    }
+                    if (preview.targetsTruncated) {
+                        HorizontalDivider()
+                        Text(
+                            hiddenFileTargetsMessage(preview.hiddenTargetCount),
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
                     }
                 }
             }
@@ -1622,8 +1644,8 @@ private fun FileChangesTool(item: TimelineItem, modifier: Modifier) {
 }
 
 @Composable
-private fun FileChangeBlock(change: FileChangeSummary) {
-    val counts = diffLineCounts(change.diff)
+private fun FileChangeBlock(preview: BoundedFileChangePreview) {
+    val counts = diffLineCounts(preview.diff)
     Column(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp),
@@ -1632,7 +1654,8 @@ private fun FileChangeBlock(change: FileChangeSummary) {
             Icon(Icons.Outlined.Description, contentDescription = null, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(8.dp))
             Text(
-                change.path,
+                preview.movePath?.let { "${preview.path.ifEmpty { "…" }} → ${it.ifEmpty { "…" }}" }
+                    ?: preview.path.ifEmpty { if (preview.targetTruncated) "…" else "" },
                 modifier = Modifier.weight(1f),
                 style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 maxLines = 1,
@@ -1643,7 +1666,7 @@ private fun FileChangeBlock(change: FileChangeSummary) {
                 color = MaterialTheme.colorScheme.surface,
             ) {
                 Text(
-                    change.kind.displayFileChangeKind(),
+                    preview.kind.displayFileChangeKind(),
                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1658,12 +1681,12 @@ private fun FileChangeBlock(change: FileChangeSummary) {
                 )
             }
         }
-        if (change.diff.isNotBlank()) {
+        if (preview.diff.isNotBlank()) {
             Column(
                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
                     .background(MaterialTheme.colorScheme.surface),
             ) {
-                change.diff.lineSequence().forEach { line ->
+                preview.diff.lineSequence().forEach { line ->
                     val background = when {
                         line.startsWith("+") && !line.startsWith("+++") -> DiffGreen.copy(alpha = 0.55f)
                         line.startsWith("-") && !line.startsWith("---") -> DiffRed.copy(alpha = 0.55f)
@@ -1679,6 +1702,22 @@ private fun FileChangeBlock(change: FileChangeSummary) {
                     )
                 }
             }
+        }
+        if (preview.diffTruncated) {
+            Text(
+                "Diff preview truncated for safety.",
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        if (preview.targetTruncated) {
+            Text(
+                "File target label truncated for safety.",
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
@@ -1736,7 +1775,7 @@ private fun ExpandableTool(
                 Spacer(Modifier.width(6.dp))
                 Icon(
                     if (expanded) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight,
-                    contentDescription = if (expanded) "收起" else "展开",
+                    contentDescription = if (expanded) "Collapse" else "Expand",
                     modifier = Modifier.size(18.dp),
                 )
             }
@@ -2223,7 +2262,7 @@ private fun Composer(
                                 if (text.text.isEmpty()) {
                                     Text(
                                         if (goalModeActive) {
-                                            "描述你的目标，最好包含可衡量的结果"
+                                            "Describe your goal, ideally with a measurable outcome"
                                         } else {
                                             "Ask Codex"
                                         },
@@ -2351,7 +2390,7 @@ private fun Composer(
                                 enabled = state.activeTurnId != null,
                                 modifier = Modifier.size(34.dp),
                             ) {
-                                Icon(Icons.Outlined.Stop, contentDescription = "停止")
+                                Icon(Icons.Outlined.Stop, contentDescription = "Stop")
                             }
                             Spacer(Modifier.width(4.dp))
                         }
@@ -2437,7 +2476,7 @@ private fun Composer(
                             ) {
                                 Icon(
                                     Icons.AutoMirrored.Outlined.Send,
-                                    contentDescription = if (state.isTurnRunning) "追加到当前任务" else "发送",
+                                    contentDescription = if (state.isTurnRunning) "Add to current turn" else "Send",
                                     tint = MaterialTheme.colorScheme.onPrimary,
                                 )
                             }
@@ -2485,7 +2524,7 @@ private fun ComposerAddMenu(
 ) {
     Box {
         IconButton(onClick = onOpen, modifier = modifier.size(32.dp)) {
-            Icon(Icons.Outlined.Add, contentDescription = "添加", modifier = Modifier.size(20.dp))
+            Icon(Icons.Outlined.Add, contentDescription = "Add", modifier = Modifier.size(20.dp))
         }
         DropdownMenu(
             expanded = expanded,
@@ -2494,42 +2533,42 @@ private fun ComposerAddMenu(
             properties = properties,
         ) {
             Text(
-                "添加",
+                "Add",
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             AddMenuItem(
                 icon = Icons.Outlined.FolderOpen,
-                title = "文件和文件夹",
-                description = "选择远端项目中的路径",
+                title = "Files and folders",
+                description = "Choose a path in the remote project",
                 enabled = canBrowseRemoteFiles,
                 onClick = onBrowseRemoteFiles,
             )
             AddMenuItem(
                 icon = Icons.Outlined.Image,
-                title = "图片",
-                description = "从 Android 设备添加图片",
+                title = "Image",
+                description = "Add an image from this Android device",
                 enabled = canAttachImage,
                 onClick = onAttachImage,
             )
             AddMenuItem(
                 icon = Icons.Outlined.Flag,
-                title = "目标",
-                description = "设置要持续追求的目标",
+                title = "Goal",
+                description = "Set a goal for Codex to keep pursuing",
                 onClick = onOpenGoal,
             )
             AddMenuItem(
                 icon = Icons.AutoMirrored.Outlined.List,
-                title = "计划模式",
-                description = "开启远端计划模式",
+                title = "Plan mode",
+                description = "Enable Plan mode on the remote Codex",
                 enabled = planModeAvailable,
                 onClick = onPlanMode,
             )
             if (skills.isNotEmpty() || plugins.isNotEmpty()) {
                 HorizontalDivider(Modifier.padding(vertical = 4.dp))
                 Text(
-                    "技能和插件",
+                    "Skills and plugins",
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2601,7 +2640,7 @@ private fun RemotePathPickerDialog(
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("文件和文件夹") },
+        title = { Text("Files and folders") },
         text = {
             Column {
                 Text(
@@ -2625,7 +2664,7 @@ private fun RemotePathPickerDialog(
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         Text(state.remoteDirectoryError, color = MaterialTheme.colorScheme.error)
-                        TextButton(onClick = { onNavigate(currentPath) }) { Text("重试") }
+                        TextButton(onClick = { onNavigate(currentPath) }) { Text("Retry") }
                     }
                     else -> LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp)) {
                         if (parentPath != null) {
@@ -2640,7 +2679,7 @@ private fun RemotePathPickerDialog(
                             }
                         }
                         if (state.remoteDirectoryEntries.isEmpty() && parentPath == null) {
-                            item { Text("该文件夹为空", Modifier.padding(vertical = 24.dp)) }
+                            item { Text("This folder is empty", Modifier.padding(vertical = 24.dp)) }
                         }
                     }
                 }
@@ -2648,10 +2687,10 @@ private fun RemotePathPickerDialog(
         },
         confirmButton = {
             TextButton(onClick = { onSelect(currentPath) }, enabled = !state.isRemoteDirectoryLoading) {
-                Text("选择此文件夹")
+                Text("Select this folder")
             }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
@@ -3258,11 +3297,11 @@ internal fun permissionModeFor(
 private fun permissionModeLabel(state: AppUiState): String = when (
     permissionModeFor(state.selectedPermissionProfile, state.approvalPolicy, state.approvalsReviewer)
 ) {
-    PermissionMode.ASK -> "询问"
-    PermissionMode.AUTO_REVIEW -> "替我审批"
-    PermissionMode.FULL_ACCESS -> "完全访问"
-    PermissionMode.READ_ONLY -> "只读"
-    null -> state.selectedPermissionProfile?.removePrefix(":") ?: "询问"
+    PermissionMode.ASK -> "Ask"
+    PermissionMode.AUTO_REVIEW -> "Auto review"
+    PermissionMode.FULL_ACCESS -> "Full access"
+    PermissionMode.READ_ONLY -> "Read only"
+    null -> state.selectedPermissionProfile?.removePrefix(":") ?: "Ask"
 }
 
 @Composable
@@ -3286,26 +3325,26 @@ private fun PermissionDropdown(
         properties = properties,
     ) {
         PermissionDropdownItem(
-            title = "询问",
-            description = "需要执行命令或修改文件时询问",
+            title = "Ask",
+            description = "Ask before running commands or changing files",
             selected = selectedMode == PermissionMode.ASK,
             onClick = { onSetPermissionMode(PermissionMode.ASK) },
         )
         PermissionDropdownItem(
-            title = "替我审批",
-            description = "由 Codex 自动审查需要批准的操作",
+            title = "Auto review",
+            description = "Let Codex review actions that need approval",
             selected = selectedMode == PermissionMode.AUTO_REVIEW,
             onClick = { onSetPermissionMode(PermissionMode.AUTO_REVIEW) },
         )
         PermissionDropdownItem(
-            title = "完全访问",
-            description = "无需询问即可访问远端工作区和网络",
+            title = "Full access",
+            description = "Allow remote workspace and network access without asking",
             selected = selectedMode == PermissionMode.FULL_ACCESS,
             onClick = { onSetPermissionMode(PermissionMode.FULL_ACCESS) },
         )
         PermissionDropdownItem(
-            title = "只读",
-            description = "允许读取，但不允许修改远端文件",
+            title = "Read only",
+            description = "Allow reading, but no remote file changes",
             selected = selectedMode == PermissionMode.READ_ONLY,
             onClick = { onSetPermissionMode(PermissionMode.READ_ONLY) },
         )
@@ -3375,7 +3414,7 @@ private fun ContextUsageRing(
     IconButton(
         onClick = onClick,
         modifier = modifier.size(32.dp).semantics {
-            contentDescription = if (usage == null) "上下文用量尚不可用" else "上下文已使用 $percent%"
+            contentDescription = if (usage == null) "Context usage unavailable" else "Context $percent% used"
         },
     ) {
         Canvas(Modifier.size(21.dp)) {
@@ -3424,14 +3463,14 @@ private fun ModelSettingsDropdown(
         when (page) {
             ModelSettingsPage.ROOT -> {
                 ModelSettingsNavigationRow(
-                    label = "模型",
-                    value = selectedModel?.displayName ?: "未选择",
+                    label = "Model",
+                    value = selectedModel?.displayName ?: "Not selected",
                     enabled = state.models.isNotEmpty(),
                     onClick = { onPageChange(ModelSettingsPage.MODEL) },
                 )
                 ModelSettingsNavigationRow(
-                    label = "推理强度",
-                    value = state.selectedReasoningEffort?.displayEffort() ?: "默认",
+                    label = "Reasoning effort",
+                    value = state.selectedReasoningEffort?.displayEffort() ?: "Default",
                     enabled = selectedModel?.supportedReasoningEfforts?.isNotEmpty() == true,
                     onClick = { onPageChange(ModelSettingsPage.REASONING) },
                 )
@@ -3443,7 +3482,7 @@ private fun ModelSettingsDropdown(
                                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                                     Text("Fast", modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
                                     Text(
-                                        if (state.selectedServiceTier == fastTier.id) "开启" else "关闭",
+                                        if (state.selectedServiceTier == fastTier.id) "On" else "Off",
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
@@ -3461,15 +3500,15 @@ private fun ModelSettingsDropdown(
                         )
                     } else {
                         ModelSettingsNavigationRow(
-                            label = "速度",
-                            value = selectedTier?.name ?: "标准",
+                            label = "Speed",
+                            value = selectedTier?.name ?: "Standard",
                             onClick = { onPageChange(ModelSettingsPage.SERVICE_TIER) },
                         )
                     }
                 }
             }
             ModelSettingsPage.MODEL -> {
-                ModelSettingsBackRow("模型") { onPageChange(ModelSettingsPage.ROOT) }
+                ModelSettingsBackRow("Model") { onPageChange(ModelSettingsPage.ROOT) }
                 state.models.forEach { model ->
                     DropdownMenuItem(
                         text = {
@@ -3497,7 +3536,7 @@ private fun ModelSettingsDropdown(
                 }
             }
             ModelSettingsPage.REASONING -> {
-                ModelSettingsBackRow("推理强度") { onPageChange(ModelSettingsPage.ROOT) }
+                ModelSettingsBackRow("Reasoning effort") { onPageChange(ModelSettingsPage.ROOT) }
                 selectedModel?.supportedReasoningEfforts.orEmpty().forEach { effort ->
                     DropdownMenuItem(
                         text = {
@@ -3527,9 +3566,9 @@ private fun ModelSettingsDropdown(
                 }
             }
             ModelSettingsPage.SERVICE_TIER -> {
-                ModelSettingsBackRow("速度") { onPageChange(ModelSettingsPage.ROOT) }
+                ModelSettingsBackRow("Speed") { onPageChange(ModelSettingsPage.ROOT) }
                 DropdownMenuItem(
-                    text = { Text("标准") },
+                    text = { Text("Standard") },
                     onClick = {
                         onSetServiceTier(null)
                         onPageChange(ModelSettingsPage.ROOT)
@@ -3599,7 +3638,7 @@ private fun ModelSettingsNavigationRow(
 private fun ModelSettingsBackRow(title: String, onClick: () -> Unit) {
     DropdownMenuItem(
         text = { Text(title, style = MaterialTheme.typography.labelLarge) },
-        leadingIcon = { Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "返回") },
+        leadingIcon = { Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = "Back") },
         onClick = onClick,
     )
     HorizontalDivider(Modifier.padding(horizontal = 12.dp))
@@ -3610,7 +3649,7 @@ internal fun modelSettingsSummary(
     effort: String?,
     serviceTier: String?,
 ): String = listOfNotNull(
-    modelId?.removePrefix("gpt-")?.removePrefix("GPT-") ?: "模型",
+    modelId?.removePrefix("gpt-")?.removePrefix("GPT-") ?: "Model",
     effort?.displayEffort(),
     serviceTier?.takeUnless { it.equals("standard", ignoreCase = true) },
 ).joinToString(" · ")
@@ -3665,13 +3704,13 @@ private fun GoalModeIndicator(
     ) {
         Icon(
             Icons.Outlined.Flag,
-            contentDescription = "取消目标标记",
+            contentDescription = "Remove goal marker",
             modifier = Modifier.size(15.dp),
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.width(5.dp))
         Text(
-            "目标",
+            "Goal",
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
@@ -3856,7 +3895,8 @@ private fun RemoteAuthenticationState(
             Text("Sign in to remote Codex", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(6.dp))
             Text(
-                "SSH 已连接，但远端 Codex 没有可用账号。登录会发生在远端主机，完成后会自动加载模型。",
+                "SSH is connected, but no Codex account is available on the remote host. " +
+                    "Sign-in happens on the remote host; models will load automatically when it completes.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -3899,16 +3939,23 @@ private fun ConnectionState(
 
 @Composable
 private fun ApprovalDialog(
+    requestKey: ApprovalQueueKey,
     approval: com.codex.remote.domain.ApprovalRequest,
-    onDecision: (String, Map<String, List<String>>) -> Unit,
+    fileChanges: List<FileChangeSummary>,
+    canApprove: Boolean,
+    isResponding: Boolean,
+    onDecision: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit,
+    onDisconnect: () -> Unit,
 ) {
-    val answers = remember(approval.requestId) {
+    val answers = remember(requestKey) {
         mutableStateMapOf<String, String>().apply {
             approval.questions.forEach { question ->
-                this[question.id] = question.options.firstOrNull().orEmpty()
+                this[question.id] = if (question.isOther) "" else question.options.firstOrNull()?.label.orEmpty()
             }
         }
     }
+    val fileChangePreview = aggregateFileChangePreview(fileChanges)
+    val approvalEnabled = canApprove && fileChangePreview.fullyReviewable
     AlertDialog(
         onDismissRequest = {},
         icon = {
@@ -3919,19 +3966,22 @@ private fun ApprovalDialog(
         },
         title = { Text(approval.title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(approval.detail, style = MaterialTheme.typography.bodyMedium)
+            Column(
+                modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 if (approval.kind == ApprovalKind.USER_INPUT) {
+                    Text(approval.detail, style = MaterialTheme.typography.bodyMedium)
                     approval.questions.forEach { question ->
                         if (question.header.isNotBlank()) {
                             Text(question.header, style = MaterialTheme.typography.labelLarge)
                         }
                         Text(question.question, style = MaterialTheme.typography.bodyMedium)
                         question.options.forEach { option ->
-                            val selected = answers[question.id] == option
+                            val selected = answers[question.id] == option.label
                             Row(
                                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
-                                    .selectable(selected = selected, onClick = { answers[question.id] = option })
+                                    .selectable(selected = selected, onClick = { answers[question.id] = option.label })
                                     .background(if (selected) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
                                     .padding(10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -3939,15 +3989,26 @@ private fun ApprovalDialog(
                                 if (selected) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(17.dp))
                                 else Spacer(Modifier.width(17.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text(option)
+                                Column {
+                                    Text(option.label)
+                                    if (option.description.isNotBlank()) {
+                                        Text(
+                                            option.description,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
                             }
                         }
-                        OutlinedTextField(
-                            value = answers[question.id].orEmpty(),
-                            onValueChange = { answers[question.id] = it },
-                            label = { Text("Response") },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                        if (question.options.isEmpty() || question.isOther) {
+                            OutlinedTextField(
+                                value = answers[question.id].orEmpty(),
+                                onValueChange = { answers[question.id] = it },
+                                label = { Text(if (question.options.isEmpty()) "Response" else "Other response") },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
                     }
                 } else {
                     Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(5.dp)) {
@@ -3955,25 +4016,182 @@ private fun ApprovalDialog(
                             Text(approval.detail, Modifier.fillMaxWidth().padding(10.dp), style = MonoText)
                         }
                     }
+                    approval.context.forEach { field ->
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text(
+                                field.label,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(5.dp),
+                            ) {
+                                SelectionContainer {
+                                    Text(
+                                        field.value,
+                                        Modifier.fillMaxWidth().padding(10.dp),
+                                        style = MonoText,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (approval.kind == ApprovalKind.FILE_CHANGE) {
+                        if (fileChanges.isEmpty()) {
+                            Text(
+                                "File targets have not arrived yet.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        } else {
+                            if (fileChangePreview.targetsTruncated) {
+                                Text(
+                                    hiddenFileTargetsMessage(
+                                        fileChangePreview.hiddenTargetCount,
+                                        approvalDisabled = true,
+                                    ),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                            if (!fileChangePreview.fullyReviewable && !fileChangePreview.targetsTruncated) {
+                                Text(
+                                    "Approval is disabled because the complete file-change request " +
+                                        "cannot be displayed within safety limits.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            }
+                            fileChangePreview.files.forEach { file ->
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    shape = RoundedCornerShape(5.dp),
+                                ) {
+                                    ApprovalFileChangeBlock(file)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         },
         confirmButton = {
-            Button(onClick = {
-                onDecision("accept", answers.mapValues { listOf(it.value) })
-            }, enabled = approval.kind != ApprovalKind.USER_INPUT || answers.values.all { it.isNotBlank() }) {
-                Text(if (approval.kind == ApprovalKind.USER_INPUT) "Send" else "Allow once")
+            if (approval.supportsDecision("accept")) {
+                Button(
+                    onClick = {
+                        onDecision(requestKey, "accept", answers.mapValues { listOf(it.value) })
+                    },
+                    enabled = !isResponding && approvalEnabled &&
+                        (approval.kind != ApprovalKind.USER_INPUT || answers.values.all { it.isNotBlank() }),
+                ) {
+                    Text(if (approval.kind == ApprovalKind.USER_INPUT) "Send" else "Allow once")
+                }
             }
         },
         dismissButton = {
-            Row {
-                TextButton(onClick = { onDecision("decline", emptyMap()) }) { Text("Deny") }
-                if (approval.kind == ApprovalKind.COMMAND || approval.kind == ApprovalKind.FILE_CHANGE) {
-                    TextButton(onClick = { onDecision("acceptForSession", emptyMap()) }) { Text("Allow session") }
+            Column(horizontalAlignment = Alignment.End) {
+                Row {
+                    if (approval.supportsDecision("decline")) {
+                        TextButton(
+                            onClick = { onDecision(requestKey, "decline", emptyMap()) },
+                            enabled = !isResponding,
+                        ) { Text("Deny") }
+                    }
+                    if (approval.supportsDecision("cancel")) {
+                        TextButton(
+                            onClick = { onDecision(requestKey, "cancel", emptyMap()) },
+                            enabled = !isResponding,
+                        ) { Text("Cancel turn") }
+                    }
+                    if (approval.supportsDecision("acceptForSession")) {
+                        TextButton(
+                            onClick = { onDecision(requestKey, "acceptForSession", emptyMap()) },
+                            enabled = !isResponding && approvalEnabled,
+                        ) { Text("Allow session") }
+                    }
+                }
+                TextButton(onClick = onDisconnect) {
+                    Text("Disconnect")
                 }
             }
         },
     )
+}
+
+private fun hiddenFileTargetsMessage(
+    hiddenTargetCount: Int,
+    approvalDisabled: Boolean = false,
+): String {
+    val targetLabel = if (hiddenTargetCount == 1) "target" else "targets"
+    val approvalNotice = if (approvalDisabled) " Approval is disabled." else ""
+    return "$hiddenTargetCount additional file $targetLabel hidden for safety.$approvalNotice"
+}
+
+@Composable
+private fun ApprovalFileChangeBlock(preview: BoundedFileChangePreview) {
+    val counts = diffLineCounts(preview.diff)
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Text(
+            "Target path",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        SelectionContainer {
+            Text(
+                preview.path.ifEmpty { if (preview.targetTruncated) "…" else "" },
+                modifier = Modifier.fillMaxWidth(),
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            )
+        }
+        preview.movePath?.let { movePath ->
+            Text(
+                "Move target",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            SelectionContainer {
+                Text(
+                    movePath.ifEmpty { if (preview.targetTruncated) "…" else "" },
+                    modifier = Modifier.fillMaxWidth(),
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                )
+            }
+        }
+        Text(
+            "${preview.kind.displayFileChangeKind()}  +${counts.first}  -${counts.second}",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (preview.diff.isNotEmpty()) {
+            SelectionContainer {
+                Text(
+                    preview.diff,
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                        .background(MaterialTheme.colorScheme.surface).padding(10.dp),
+                    style = MonoText,
+                    softWrap = false,
+                )
+            }
+        }
+        if (preview.diffTruncated) {
+            Text(
+                "Diff preview truncated for safety.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        if (preview.targetTruncated) {
+            Text(
+                "File target label truncated for safety.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
 }
 
 @Composable
@@ -4033,7 +4251,10 @@ private fun RemoteDeviceLoginDialog(
         title = { Text("Sign in to remote Codex") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("在浏览器中打开登录页并输入设备码。完成后此窗口会自动关闭。")
+                Text(
+                    "Open the sign-in page in a browser and enter the device code. " +
+                        "This dialog closes automatically when sign-in completes.",
+                )
                 Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(5.dp)) {
                     SelectionContainer {
                         Text(
@@ -4077,7 +4298,8 @@ private fun HostKeyConfirmationDialog(
                     }
                 }
                 Text(
-                    "请与服务器管理员或 ssh-keygen 输出核对此指纹。确认前不会发送登录凭据。",
+                    "Verify this fingerprint with the server administrator or ssh-keygen output. " +
+                        "Login credentials will not be sent until you confirm.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -4094,14 +4316,14 @@ private fun formatThreadTime(epochSeconds: Long): String {
 }
 
 private fun String.displayEffort(): String = when (lowercase()) {
-    "none" -> "无"
-    "minimal" -> "最低"
-    "low" -> "低"
-    "medium" -> "中"
-    "high" -> "高"
-    "xhigh" -> "很高"
-    "ultra" -> "极高"
-    "max" -> "最高"
+    "none" -> "None"
+    "minimal" -> "Minimal"
+    "low" -> "Low"
+    "medium" -> "Medium"
+    "high" -> "High"
+    "xhigh" -> "Extra high"
+    "ultra" -> "Ultra"
+    "max" -> "Maximum"
     else -> replaceFirstChar { character ->
         if (character.isLowerCase()) character.titlecase() else character.toString()
     }

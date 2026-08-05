@@ -16,11 +16,11 @@ from typing import Any
 import paramiko
 
 
-RICH_MARKDOWN_REPLY = r"""## 远端渲染检查
+RICH_MARKDOWN_REPLY = r"""## 원격 렌더링 확인
 
-**粗体应该直接显示为粗体**，而不是保留星号。
+**굵은 글씨는 별표를 남기지 않고 굵게 표시되어야 합니다.**
 
-行内公式：$E = mc^2$，以及块级公式：
+인라인 수식: $E = mc^2$, 그리고 블록 수식:
 
 $$
 \int_0^1 x^2\,dx = \frac{1}{3}
@@ -32,13 +32,13 @@ fun answer(): Int {
 }
 ```
 
-| 项目 | 状态 |
+| 항목 | 상태 |
 | --- | --- |
-| Markdown | 已渲染 |
-| LaTeX | 已渲染 |
+| Markdown | 렌더링됨 |
+| LaTeX | 렌더링됨 |
 
 """ + "\n\n".join(
-    f"第 {index} 段用于验证长回复的绝对底部滚动。这里保留足够的正文高度，确保最后一条消息远高于一个手机屏幕。"
+    f"{index}번째 문단은 긴 답변의 맨 아래 스크롤을 검증합니다. 마지막 메시지가 휴대폰 한 화면보다 훨씬 길도록 충분한 본문 높이를 유지합니다."
     for index in range(1, 25)
 )
 
@@ -368,6 +368,7 @@ class MockAppServer:
         elif method is None and message.get("id") == 9001 and self.pending_approval_turn is not None:
             self.events.write("approval_response", result=message.get("result", {}))
             turn_id, thread_id = self.pending_approval_turn
+            self.notification("serverRequest/resolved", {"threadId": thread_id, "requestId": 9001})
             self.finish_approval_turn(turn_id, thread_id)
             self.pending_approval_turn = None
         elif "id" in message:
@@ -426,6 +427,7 @@ class MockAppServer:
             "item/started",
             {
                 "threadId": thread_id,
+                "turnId": turn_id,
                 "item": {
                     "type": "userMessage",
                     "id": f"user-{self.turn_counter}",
@@ -439,7 +441,20 @@ class MockAppServer:
                 {
                     "id": 9001,
                     "method": "item/commandExecution/requestApproval",
-                    "params": {"command": "git status --short", "reason": "Verify Android approval UI"},
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": f"approval-command-{self.turn_counter}",
+                        "startedAtMs": int(time.time() * 1000),
+                        "command": "git status --short",
+                        "cwd": "/workspace/demo",
+                        "reason": "Verify Android approval UI",
+                        "commandActions": [
+                            {"type": "unknown", "command": "git status --short"},
+                        ],
+                        "additionalPermissions": None,
+                        "availableDecisions": ["accept", "acceptForSession", "decline"],
+                    },
                 }
             )
             return
@@ -449,9 +464,9 @@ class MockAppServer:
         reasoning = {
             "type": "reasoning",
             "id": f"reasoning-{self.turn_counter}",
-            "summary": ["检查远端项目并规划验证步骤。"],
+            "summary": ["원격 프로젝트를 확인하고 검증 단계를 계획합니다."],
         }
-        self.notification("item/started", {"threadId": thread_id, "item": reasoning})
+        self.notification("item/started", {"threadId": thread_id, "turnId": turn_id, "item": reasoning})
         for command_index, (command_text, output) in enumerate(
             (("pwd", "/workspace/demo\n"), ("git status --short", " M app/src/Main.kt\n")),
             start=1,
@@ -463,7 +478,7 @@ class MockAppServer:
                 "status": "inProgress",
                 "aggregatedOutput": output,
             }
-            self.notification("item/started", {"threadId": thread_id, "item": command})
+            self.notification("item/started", {"threadId": thread_id, "turnId": turn_id, "item": command})
         file_change = {
             "type": "fileChange",
             "id": f"files-{self.turn_counter}",
@@ -481,14 +496,18 @@ class MockAppServer:
                 },
             ],
         }
-        self.notification("item/started", {"threadId": thread_id, "item": file_change})
+        self.notification("item/started", {"threadId": thread_id, "turnId": turn_id, "item": file_change})
         item_id = f"agent-{self.turn_counter}"
-        reply = f"收到：{prompt}\n\n{RICH_MARKDOWN_REPLY}"
+        reply = f"수신: {prompt}\n\n{RICH_MARKDOWN_REPLY}"
         self.notification(
             "item/started",
-            {"threadId": thread_id, "item": {"type": "agentMessage", "id": item_id, "text": ""}},
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {"type": "agentMessage", "id": item_id, "text": ""},
+            },
         )
-        for delta in (f"收到：{prompt}\n\n", RICH_MARKDOWN_REPLY):
+        for delta in (f"수신: {prompt}\n\n", RICH_MARKDOWN_REPLY):
             time.sleep(0.15)
             self.notification(
                 "item/agentMessage/delta",
@@ -496,7 +515,11 @@ class MockAppServer:
             )
         self.notification(
             "item/completed",
-            {"threadId": thread_id, "item": {"type": "agentMessage", "id": item_id, "text": reply}},
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {"type": "agentMessage", "id": item_id, "text": reply},
+            },
         )
         self.notification(
             "thread/tokenUsage/updated",
@@ -526,8 +549,8 @@ class MockAppServer:
             "status": "completed",
             "aggregatedOutput": " M demo.txt\n",
         }
-        self.notification("item/started", {"threadId": thread_id, "item": command})
-        self.notification("item/completed", {"threadId": thread_id, "item": command})
+        self.notification("item/started", {"threadId": thread_id, "turnId": turn_id, "item": command})
+        self.notification("item/completed", {"threadId": thread_id, "turnId": turn_id, "item": command})
         self.finish_turn(turn_id, thread_id, "request approval")
 
     @staticmethod

@@ -3,6 +3,8 @@ package com.codex.remote.data.rpc
 import com.codex.remote.BuildConfig
 import com.codex.remote.data.ssh.ActiveSshTransport
 import com.codex.remote.domain.ApprovalKind
+import com.codex.remote.domain.ApprovalContextField
+import com.codex.remote.domain.ApprovalOption
 import com.codex.remote.domain.ApprovalQuestion
 import com.codex.remote.domain.ApprovalRequest
 import com.codex.remote.domain.ComposerMention
@@ -29,6 +31,7 @@ import com.codex.remote.domain.RemoteThreadSession
 import com.codex.remote.domain.RemoteThreadSettingsSnapshot
 import com.codex.remote.domain.RemoteThreadTokenUsage
 import com.codex.remote.domain.ReviewTargetKind
+import com.codex.remote.domain.RpcRequestId
 import com.codex.remote.domain.StartedRemoteReview
 import com.codex.remote.domain.StartedRemoteThread
 import com.codex.remote.domain.TimelineItem
@@ -63,8 +66,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import java.io.BufferedReader
 import java.io.Closeable
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 sealed interface AppServerEvent {
@@ -79,6 +85,7 @@ sealed interface AppServerEvent {
         val turnId: String? = null,
     ) : AppServerEvent
     data class Approval(val threadId: String?, val request: ApprovalRequest) : AppServerEvent
+    data class ApprovalResolved(val threadId: String, val requestId: RpcRequestId) : AppServerEvent
     data object AccountChanged : AppServerEvent
     data object ThreadsChanged : AppServerEvent
     data object SkillsChanged : AppServerEvent
@@ -94,19 +101,204 @@ sealed interface AppServerEvent {
     ) : AppServerEvent
     data class LoginCompleted(val success: Boolean, val error: String?) : AppServerEvent
     data class Failure(val message: String, val threadId: String? = null) : AppServerEvent
+    data class FatalProtocolError(val message: String) : AppServerEvent
     data class Warning(val message: String) : AppServerEvent
     data class Diagnostic(val message: String) : AppServerEvent
 }
 
 class RpcException(message: String, val code: Int? = null) : Exception(message)
 
+internal class AppServerLineTooLongException(maxChars: Int) :
+    IOException("Remote app-server line exceeded the $maxChars character limit")
+
+internal fun BufferedReader.readBoundedLine(maxChars: Int): String? {
+    require(maxChars > 0) { "maxChars must be positive" }
+    val line = StringBuilder(minOf(maxChars, 4_096))
+    while (true) {
+        val next = read()
+        if (next == -1 || next == '\n'.code) {
+            if (line.isNotEmpty() && line.last() == '\r') line.setLength(line.length - 1)
+            return if (next == -1 && line.isEmpty()) null else line.toString()
+        }
+        if (line.length >= maxChars) {
+            if (line.length == maxChars && next == '\r'.code) {
+                line.append(next.toChar())
+                continue
+            }
+            throw AppServerLineTooLongException(maxChars)
+        }
+        line.append(next.toChar())
+    }
+}
+
+private fun diagnosticPreview(value: String): String = if (value.length <= MAX_DIAGNOSTIC_CHARS) {
+    value
+} else {
+    value.take(MAX_DIAGNOSTIC_CHARS) + "… [truncated]"
+}
+
+internal class OutstandingApprovalRequests {
+    private enum class State { PENDING, RESPONDING, RESPONDED, RESOLVED_DURING_RESPONSE }
+    private data class TrackedRequest(
+        val threadId: String?,
+        val retainedChars: Long,
+        var state: State,
+    )
+
+    private val lock = Any()
+    private val requests = mutableMapOf<RpcRequestId, TrackedRequest>()
+    private var retainedIdChars = 0L
+    private var retainedApprovalChars = 0L
+    private var invalid = false
+
+    fun reserve(
+        id: RpcRequestId,
+        threadId: String? = null,
+        retainedChars: Long = id.displayValue.length.toLong(),
+    ): Boolean = synchronized(lock) {
+        val idChars = id.displayValue.length.toLong()
+        val effectiveRetainedChars = maxOf(idChars, retainedChars)
+        if (invalid || id in requests || requests.size >= MAX_TRACKED_APPROVAL_REQUESTS ||
+            idChars > MAX_TRACKED_APPROVAL_ID_CHARS - retainedIdChars ||
+            effectiveRetainedChars > MAX_TRACKED_APPROVAL_RETAINED_CHARS - retainedApprovalChars
+        ) {
+            invalid = true
+            false
+        } else {
+            requests[id] = TrackedRequest(threadId, effectiveRetainedChars, State.PENDING)
+            retainedIdChars += idChars
+            retainedApprovalChars += effectiveRetainedChars
+            true
+        }
+    }
+
+    fun invalidate() = synchronized(lock) {
+        invalid = true
+    }
+
+    fun resolve(id: RpcRequestId, threadId: String? = null): Boolean = synchronized(lock) {
+        if (invalid) return@synchronized false
+        val tracked = requests[id]
+        if (tracked == null || tracked.threadId != threadId) {
+            invalid = true
+            return@synchronized false
+        }
+        when (tracked.state) {
+            State.PENDING, State.RESPONDED -> {
+                requests.remove(id)
+                retainedIdChars -= id.displayValue.length.toLong()
+                retainedApprovalChars -= tracked.retainedChars
+                true
+            }
+            State.RESPONDING -> {
+                tracked.state = State.RESOLVED_DURING_RESPONSE
+                true
+            }
+            State.RESOLVED_DURING_RESPONSE -> {
+                invalid = true
+                false
+            }
+        }
+    }
+
+    suspend fun respondAndTrackUntilResolved(id: RpcRequestId, send: suspend () -> Unit) {
+        synchronized(lock) {
+            val tracked = requests[id]
+            if (invalid || tracked?.state != State.PENDING) {
+                invalid = true
+                throw RpcException("Approval request is no longer safe to answer")
+            }
+            tracked.state = State.RESPONDING
+        }
+        try {
+            send()
+        } catch (error: Throwable) {
+            synchronized(lock) {
+                invalid = true
+            }
+            throw error
+        }
+
+        val delivered = synchronized(lock) {
+            if (invalid) {
+                false
+            } else when (requests[id]?.state) {
+                State.RESPONDING -> {
+                    requests.getValue(id).state = State.RESPONDED
+                    true
+                }
+                State.RESOLVED_DURING_RESPONSE -> {
+                    val tracked = requests.remove(id)!!
+                    retainedIdChars -= id.displayValue.length.toLong()
+                    retainedApprovalChars -= tracked.retainedChars
+                    true
+                }
+                else -> {
+                    invalid = true
+                    false
+                }
+            }
+        }
+        if (!delivered) {
+            throw RpcException("Approval request changed state while the response was being sent")
+        }
+    }
+}
+
+internal fun trackedServerRequestEvent(
+    requests: OutstandingApprovalRequests,
+    id: RpcRequestId,
+    method: String,
+    params: JsonObject,
+): AppServerEvent {
+    val rawParams = params.toString()
+    val messageChars = id.displayValue.length.toLong() + method.length.toLong() + rawParams.length.toLong()
+    if (messageChars > MAX_APPROVAL_MESSAGE_CHARS) {
+        requests.invalidate()
+        return AppServerEvent.FatalProtocolError(
+            "Remote approval request exceeded the safe size limit; disconnected without responding.",
+        )
+    }
+    val request = CodexRpcClient.parseApprovalRequest(id, method, params, rawParams)
+    if (request.kind == ApprovalKind.UNKNOWN) {
+        requests.invalidate()
+        return AppServerEvent.FatalProtocolError(
+            "Remote sent an unsupported JSON-RPC server request; disconnected without guessing a response.",
+        )
+    }
+    if (!requests.reserve(id, request.threadId, request.retainedCharCount)) {
+        return AppServerEvent.FatalProtocolError(
+            "Remote reused an outstanding approval request ID or exceeded the safe tracking limit; " +
+                "disconnected without responding.",
+        )
+    }
+    return AppServerEvent.Approval(request.threadId, request)
+}
+
+internal fun trackedServerRequestResolvedEvent(
+    requests: OutstandingApprovalRequests,
+    params: JsonObject,
+): AppServerEvent {
+    val threadId = params.strictString("threadId")?.takeIf(String::isNotBlank)
+    val requestId = params["requestId"]?.let(CodexRpcClient::parseRequestId)
+    if (threadId == null || requestId == null || !requests.resolve(requestId, threadId)) {
+        requests.invalidate()
+        return AppServerEvent.FatalProtocolError(
+            "Remote sent an invalid or unexpected approval resolution; disconnected without responding.",
+        )
+    }
+    return AppServerEvent.ApprovalResolved(threadId, requestId)
+}
+
 class CodexRpcClient(
     private val transport: ActiveSshTransport,
 ) : Closeable {
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val requestId = AtomicLong(1)
-    private val pending = ConcurrentHashMap<String, CompletableDeferred<JsonObject>>()
+    private val pending = ConcurrentHashMap<RpcRequestId, CompletableDeferred<JsonObject>>()
     private val writeMutex = Mutex()
+    private val outstandingApprovalRequests = OutstandingApprovalRequests()
+    private val protocolTerminationStarted = AtomicBoolean(false)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _events = MutableSharedFlow<AppServerEvent>(extraBufferCapacity = 128)
     val events: SharedFlow<AppServerEvent> = _events
@@ -224,10 +416,10 @@ class CodexRpcClient(
     suspend fun startDeviceLogin(): RemoteDeviceLogin {
         val result = request("account/login/start", buildJsonObject { put("type", "chatgptDeviceCode") })
         return RemoteDeviceLogin(
-            loginId = result.string("loginId") ?: throw RpcException("远端未返回登录 ID"),
+            loginId = result.string("loginId") ?: throw RpcException("Remote did not return a login ID"),
             verificationUrl = result.string("verificationUrl")
-                ?: throw RpcException("远端未返回设备登录地址"),
-            userCode = result.string("userCode") ?: throw RpcException("远端未返回设备码"),
+                ?: throw RpcException("Remote did not return a device sign-in URL"),
+            userCode = result.string("userCode") ?: throw RpcException("Remote did not return a device code"),
         )
     }
 
@@ -282,7 +474,7 @@ class CodexRpcClient(
             threadGoalSetParams(threadId, objective, status, tokenBudget),
         )
         return parseThreadGoal(result["goal"] ?: JsonNull)
-            ?: throw RpcException("thread/goal/set 未返回 goal")
+            ?: throw RpcException("thread/goal/set did not return goal")
     }
 
     suspend fun clearThreadGoal(threadId: String): Boolean {
@@ -311,15 +503,16 @@ class CodexRpcClient(
                 permissionProfile,
             ),
         )
-        val threadElement = result["thread"] ?: throw RpcException("thread/fork 未返回 thread")
-        val thread = parseThread(threadElement) ?: throw RpcException("thread/fork 返回了无效 thread")
+        val threadElement = result["thread"] ?: throw RpcException("thread/fork did not return thread")
+        val thread = parseThread(threadElement) ?: throw RpcException("thread/fork returned an invalid thread")
         val threadObject = threadElement.asObject()
         return ForkedRemoteThread(
             thread = thread,
             session = RemoteThreadSession(
-                timeline = threadObject?.array("turns").orEmpty()
-                    .flatMap { it.asObject()?.array("items").orEmpty() }
-                    .mapNotNull(::parseTimelineItem),
+                timeline = parseTurnsTimeline(
+                    threadObject?.array("turns").orEmpty(),
+                    descending = false,
+                ),
                 model = result.string("model") ?: model,
                 reasoningEffort = result.string("reasoningEffort"),
                 serviceTier = result.string("serviceTier") ?: serviceTier,
@@ -339,7 +532,7 @@ class CodexRpcClient(
     ): StartedRemoteReview {
         val result = request("review/start", reviewStartParams(threadId, targetKind, targetValue))
         return StartedRemoteReview(
-            turnId = result.obj("turn")?.string("id") ?: throw RpcException("review/start 未返回 turn.id"),
+            turnId = result.obj("turn")?.string("id") ?: throw RpcException("review/start did not return turn.id"),
             threadId = result.string("reviewThreadId") ?: threadId,
         )
     }
@@ -358,7 +551,7 @@ class CodexRpcClient(
             servers += result.array("data").mapNotNull(::parseMcpServerStatus)
             cursor = result.string("nextCursor")?.takeIf(String::isNotBlank)
             if (cursor != null && !seenCursors.add(cursor)) {
-                throw RpcException("mcpServerStatus/list 返回了重复的 nextCursor")
+                throw RpcException("mcpServerStatus/list returned a duplicate nextCursor")
             }
         } while (cursor != null)
         return servers.distinctBy { it.name }.sortedBy { it.name.lowercase() }
@@ -385,7 +578,7 @@ class CodexRpcClient(
     suspend fun readRateLimits(): RemoteRateLimits {
         val result = request("account/rateLimits/read")
         return parseRateLimits(result["rateLimits"] ?: JsonNull)
-            ?: throw RpcException("account/rateLimits/read 未返回 rateLimits")
+            ?: throw RpcException("account/rateLimits/read did not return rateLimits")
     }
 
     suspend fun remotePathExists(path: String): Boolean = try {
@@ -415,7 +608,7 @@ class CodexRpcClient(
             threadStartParams(cwd, model, serviceTier, approvalPolicy, approvalsReviewer, permissionProfile),
         )
         return StartedRemoteThread(
-            id = result.obj("thread")?.string("id") ?: throw RpcException("thread/start 未返回 thread.id"),
+            id = result.obj("thread")?.string("id") ?: throw RpcException("thread/start did not return thread.id"),
             model = result.string("model") ?: model,
             reasoningEffort = result.string("reasoningEffort"),
             serviceTier = result.string("serviceTier") ?: serviceTier,
@@ -565,40 +758,33 @@ class CodexRpcClient(
         decision: String,
         answers: Map<String, List<String>> = emptyMap(),
     ) {
-        val result = when (request.kind) {
-            ApprovalKind.USER_INPUT -> buildJsonObject {
-                put("answers", buildJsonObject {
-                    request.questions.forEach { question ->
-                        val values = answers[question.id].orEmpty()
-                        if (values.isEmpty()) return@forEach
-                        put(question.id, buildJsonObject {
-                            put("answers", buildJsonArray { values.forEach { add(JsonPrimitive(it)) } })
-                        })
-                    }
-                })
-            }
-            ApprovalKind.PERMISSION -> buildJsonObject {
-                val original = runCatching { json.parseToJsonElement(request.rawParams).jsonObject }.getOrNull()
-                put(
-                    "permissions",
-                    if (decision == "accept") original?.obj("permissions") ?: buildJsonObject {}
-                    else buildJsonObject {},
-                )
-                put("scope", if (decision == "acceptForSession") "session" else "turn")
-            }
-            else -> buildJsonObject { put("decision", decision) }
+        if (!request.supportsDecision(decision)) {
+            throw RpcException("Approval decision is not available for this request")
         }
-        respond(request.requestId, result)
+        if (decision.startsWith("accept") && !request.canApprove(emptyList(), request.threadId)) {
+            throw RpcException("Approval request has incomplete security context")
+        }
+        if (request.kind == ApprovalKind.USER_INPUT && decision == "accept" && !request.canSubmitAnswers(answers)) {
+            throw RpcException("User input response is incomplete or does not match the rendered choices")
+        }
+        try {
+            outstandingApprovalRequests.respondAndTrackUntilResolved(request.requestId) {
+                respond(request.requestId, approvalResponseParams(request, decision, answers))
+            }
+        } catch (error: Throwable) {
+            transport.abort()
+            throw error
+        }
     }
 
     suspend fun request(method: String, params: JsonObject = buildJsonObject {}): JsonObject {
-        val id = requestId.getAndIncrement().toString()
+        val id = RpcRequestId.Number(requestId.getAndIncrement())
         val deferred = CompletableDeferred<JsonObject>()
         pending[id] = deferred
         try {
             send(buildJsonObject {
                 put("method", method)
-                put("id", id.toLong())
+                put("id", id.value)
                 put("params", params)
             })
             return deferred.await()
@@ -612,10 +798,7 @@ class CodexRpcClient(
         put("params", params)
     })
 
-    private suspend fun respond(id: String, result: JsonObject) = send(buildJsonObject {
-        id.toLongOrNull()?.let { put("id", it) } ?: put("id", id)
-        put("result", result)
-    })
+    private suspend fun respond(id: RpcRequestId, result: JsonObject) = send(responseEnvelope(id, result))
 
     private suspend fun send(message: JsonObject) = writeMutex.withLock {
         withContext(Dispatchers.IO) {
@@ -628,21 +811,48 @@ class CodexRpcClient(
     private suspend fun readLoop() {
         try {
             while (true) {
-                val line = transport.reader.readLine() ?: break
+                val line = try {
+                    transport.reader.readBoundedLine(MAX_APP_SERVER_LINE_CHARS)
+                } catch (_: AppServerLineTooLongException) {
+                    terminateForProtocolError(
+                        AppServerEvent.FatalProtocolError(
+                            "Remote app-server message exceeded the safe size limit; disconnected.",
+                        ),
+                    )
+                    return
+                } ?: break
                 if (line.isBlank()) continue
                 val message = runCatching { json.parseToJsonElement(line).jsonObject }.getOrNull()
                 if (message == null) {
-                    _events.emit(AppServerEvent.Diagnostic("无法解析 app-server 输出：$line"))
+                    _events.emit(
+                        AppServerEvent.Diagnostic(
+                            "Could not parse app-server output: ${diagnosticPreview(line)}",
+                        ),
+                    )
                     continue
                 }
-                val id = message["id"]?.jsonPrimitive?.contentOrNull
+                val idElement = message["id"]
+                val id = if (idElement == null) {
+                    null
+                } else {
+                    try {
+                        requireRequestId(idElement)
+                    } catch (error: RpcException) {
+                        terminateForProtocolError(
+                            AppServerEvent.FatalProtocolError(
+                                error.message ?: "Invalid app-server JSON-RPC request id",
+                            ),
+                        )
+                        return
+                    }
+                }
                 if (id != null && (message.containsKey("result") || message.containsKey("error"))) {
                     val deferred = pending.remove(id)
                     val error = message.obj("error")
                     if (error != null) {
                         deferred?.completeExceptionally(
                             RpcException(
-                                error.string("message") ?: "RPC 请求失败",
+                                error.string("message") ?: "RPC request failed",
                                 error["code"]?.jsonPrimitive?.longOrNull?.toInt(),
                             ),
                         )
@@ -653,36 +863,73 @@ class CodexRpcClient(
                 }
                 val method = message.string("method") ?: continue
                 val params = message.obj("params") ?: buildJsonObject {}
-                if (id != null) handleServerRequest(id, method, params) else handleNotification(method, params)
+                if (id != null) {
+                    if (!handleServerRequest(id, method, params)) return
+                } else {
+                    handleNotification(method, params)
+                }
             }
-            _events.emit(AppServerEvent.Failure("远端 app-server 已断开"))
+            if (!protocolTerminationStarted.get()) {
+                outstandingApprovalRequests.invalidate()
+                transport.abort()
+                _events.emit(AppServerEvent.Failure("Remote app-server disconnected"))
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
-            _events.emit(AppServerEvent.Failure(error.message ?: "SSH 数据流已中断"))
+            if (!protocolTerminationStarted.get()) {
+                outstandingApprovalRequests.invalidate()
+                transport.abort()
+                _events.emit(AppServerEvent.Failure(error.message ?: "SSH data stream was interrupted"))
+            }
         } finally {
-            val error = RpcException("远端连接已关闭")
+            val error = RpcException("Remote connection closed")
             pending.values.forEach { it.completeExceptionally(error) }
             pending.clear()
         }
     }
 
     private suspend fun stderrLoop() {
-        runCatching {
+        try {
             while (true) {
-                val line = transport.errorReader.readLine() ?: break
-                if (line.isNotBlank()) _events.emit(AppServerEvent.Diagnostic(line))
+                val line = transport.errorReader.readBoundedLine(MAX_APP_SERVER_LINE_CHARS) ?: break
+                if (line.isNotBlank()) _events.emit(AppServerEvent.Diagnostic(diagnosticPreview(line)))
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: AppServerLineTooLongException) {
+            terminateForProtocolError(
+                AppServerEvent.FatalProtocolError(
+                    "Remote app-server diagnostic exceeded the safe size limit; disconnected.",
+                ),
+            )
+        } catch (_: Throwable) {
+            // The stdout reader owns connection-level failure reporting.
         }
     }
 
     private suspend fun handleNotification(method: String, params: JsonObject) {
         when (method) {
             "item/started", "item/completed" -> params.obj("item")?.let(::parseTimelineItem)?.let { item ->
-                val status = item.status.ifBlank {
-                    if (method == "item/started") "inProgress" else "completed"
+                val threadId = params.strictString("threadId")?.takeIf(String::isNotBlank) ?: return@let
+                val turnId = params.strictString("turnId")?.takeIf(String::isNotBlank) ?: return@let
+                val status = if (method == "item/started") {
+                    "inProgress"
+                } else {
+                    item.status.takeIf { it in setOf("completed", "failed", "declined") } ?: "completed"
                 }
-                _events.emit(AppServerEvent.ItemUpsert(params.string("threadId"), item.copy(status = status)))
+                _events.emit(
+                    AppServerEvent.ItemUpsert(
+                        threadId,
+                        item.copy(status = status, turnId = turnId),
+                    ),
+                )
+            }
+            "serverRequest/resolved" -> {
+                when (val event = trackedServerRequestResolvedEvent(outstandingApprovalRequests, params)) {
+                    is AppServerEvent.FatalProtocolError -> terminateForProtocolError(event)
+                    else -> _events.emit(event)
+                }
             }
             "item/agentMessage/delta" -> _events.emit(
                 AppServerEvent.AgentDelta(
@@ -789,7 +1036,7 @@ class CodexRpcClient(
                 val error = params.obj("error")
                 _events.emit(
                     AppServerEvent.Failure(
-                        error?.string("message") ?: "Codex turn 执行失败",
+                        error?.string("message") ?: "Codex turn failed",
                         params.string("threadId"),
                     ),
                 )
@@ -801,59 +1048,109 @@ class CodexRpcClient(
         }
     }
 
-    private suspend fun handleServerRequest(id: String, method: String, params: JsonObject) {
-        val request = when (method) {
-            "item/commandExecution/requestApproval", "execCommandApproval" -> ApprovalRequest(
-                requestId = id,
-                kind = ApprovalKind.COMMAND,
-                title = "允许执行命令？",
-                detail = params.string("command") ?: params.string("reason") ?: "远端 Codex 请求执行命令",
-                rawMethod = method,
-                rawParams = params.toString(),
-            )
-            "item/fileChange/requestApproval", "applyPatchApproval" -> ApprovalRequest(
-                requestId = id,
-                kind = ApprovalKind.FILE_CHANGE,
-                title = "允许修改文件？",
-                detail = params.string("reason") ?: params.string("grantRoot") ?: "远端 Codex 请求写入项目",
-                rawMethod = method,
-                rawParams = params.toString(),
-            )
-            "item/permissions/requestApproval" -> ApprovalRequest(
-                requestId = id,
-                kind = ApprovalKind.PERMISSION,
-                title = "允许额外权限？",
-                detail = params.string("reason") ?: "远端 Codex 请求额外文件或网络权限",
-                rawMethod = method,
-                rawParams = params.toString(),
-            )
-            "item/tool/requestUserInput" -> {
-                val questions = params.array("questions").mapNotNull { element ->
-                    val question = element.asObject() ?: return@mapNotNull null
-                    val questionId = question.string("id") ?: return@mapNotNull null
-                    ApprovalQuestion(
-                        id = questionId,
-                        header = question.string("header").orEmpty(),
-                        question = question.string("question") ?: "请输入回复",
-                        options = question.array("options").mapNotNull { it.asObject()?.string("label") },
-                    )
-                }
-                ApprovalRequest(
-                    requestId = id,
-                    kind = ApprovalKind.USER_INPUT,
-                    title = questions.firstOrNull()?.header?.ifBlank { null } ?: "Codex 需要你的输入",
-                    detail = questions.firstOrNull()?.question ?: "请输入回复",
-                    rawMethod = method,
-                    rawParams = params.toString(),
-                    questions = questions,
-                )
+    private suspend fun handleServerRequest(id: RpcRequestId, method: String, params: JsonObject): Boolean {
+        return when (val event = trackedServerRequestEvent(outstandingApprovalRequests, id, method, params)) {
+            is AppServerEvent.FatalProtocolError -> {
+                terminateForProtocolError(event)
+                false
             }
-            else -> ApprovalRequest(id, ApprovalKind.UNKNOWN, "远端请求", method, method, params.toString())
+            else -> {
+                _events.emit(event)
+                true
+            }
         }
-        _events.emit(AppServerEvent.Approval(params.string("threadId"), request))
+    }
+
+    private suspend fun terminateForProtocolError(event: AppServerEvent.FatalProtocolError) {
+        if (!protocolTerminationStarted.compareAndSet(false, true)) return
+        outstandingApprovalRequests.invalidate()
+        transport.abort()
+        _events.emit(event)
     }
 
     companion object {
+        internal fun parseRequestId(element: JsonElement): RpcRequestId? {
+            val primitive = element as? JsonPrimitive ?: return null
+            return if (primitive.isString) {
+                RpcRequestId.Text(primitive.content)
+            } else {
+                primitive.longOrNull?.let { RpcRequestId.Number(it) }
+            }
+        }
+
+        internal fun requireRequestId(element: JsonElement): RpcRequestId =
+            parseRequestId(element) ?: throw RpcException("Invalid app-server JSON-RPC request id")
+
+        internal fun responseEnvelope(id: RpcRequestId, result: JsonObject): JsonObject = buildJsonObject {
+            when (id) {
+                is RpcRequestId.Text -> put("id", id.value)
+                is RpcRequestId.Number -> put("id", id.value)
+            }
+            put("result", result)
+        }
+
+        internal fun parseApprovalRequest(
+            id: RpcRequestId,
+            method: String,
+            params: JsonObject,
+            rawParams: String = params.toString(),
+        ): ApprovalRequest = when (method) {
+            "item/commandExecution/requestApproval", "execCommandApproval" ->
+                parseCommandApprovalRequest(id, method, params, rawParams)
+            "item/fileChange/requestApproval", "applyPatchApproval" ->
+                parseFileApprovalRequest(id, method, params, rawParams)
+            "item/permissions/requestApproval" -> parsePermissionApprovalRequest(id, method, params, rawParams)
+            "item/tool/requestUserInput" -> parseUserInputRequest(id, method, params, rawParams)
+            else -> ApprovalRequest(
+                requestId = id,
+                kind = ApprovalKind.UNKNOWN,
+                title = "Remote request",
+                detail = method,
+                rawMethod = method,
+                rawParams = rawParams,
+                threadId = params.string("threadId") ?: params.string("conversationId"),
+                context = listOf(ApprovalContextField("Unrecognized request", rawParams)),
+                availableDecisions = listOf("decline"),
+                securityContextComplete = false,
+            )
+        }
+
+        internal fun approvalResponseParams(
+            request: ApprovalRequest,
+            decision: String,
+            answers: Map<String, List<String>> = emptyMap(),
+        ): JsonObject = when (request.kind) {
+            ApprovalKind.USER_INPUT -> buildJsonObject {
+                if (!request.canSubmitAnswers(answers)) {
+                    throw RpcException("User input response is incomplete or does not match the rendered choices")
+                }
+                put("answers", buildJsonObject {
+                    request.questions.forEach { question ->
+                        val values = answers[question.id].orEmpty()
+                        if (values.isEmpty()) return@forEach
+                        put(question.id, buildJsonObject {
+                            put("answers", buildJsonArray { values.forEach { add(JsonPrimitive(it)) } })
+                        })
+                    }
+                })
+            }
+            ApprovalKind.PERMISSION -> buildJsonObject {
+                val original = runCatching {
+                    APPROVAL_JSON.parseToJsonElement(request.rawParams).jsonObject
+                }.getOrNull()
+                val grantsRequestedScope = decision == "accept" || decision == "acceptForSession"
+                put(
+                    "permissions",
+                    if (grantsRequestedScope) original?.obj("permissions") ?: buildJsonObject {}
+                    else buildJsonObject {},
+                )
+                put("scope", if (decision == "acceptForSession") "session" else "turn")
+            }
+            else -> buildJsonObject {
+                put("decision", approvalDecisionElement(request.rawMethod, decision))
+            }
+        }
+
         internal fun initializeParams(): JsonObject = buildJsonObject {
             put("clientInfo", buildJsonObject {
                 put("name", "codex_remote_android")
@@ -895,8 +1192,13 @@ class CodexRpcClient(
             turns: List<JsonElement>,
             descending: Boolean = true,
         ): List<TimelineItem> = (if (descending) turns.asReversed() else turns)
-            .flatMap { it.asObject()?.array("items").orEmpty() }
-            .mapNotNull(::parseTimelineItem)
+            .flatMap { turnElement ->
+                val turn = turnElement.asObject() ?: return@flatMap emptyList()
+                val turnId = turn.strictString("id")
+                turn.array("items").mapNotNull { itemElement ->
+                    parseTimelineItem(itemElement)?.copy(turnId = turnId)
+                }
+            }
 
         internal fun checkedNextHistoryCursor(
             returnedCursor: String?,
@@ -904,7 +1206,7 @@ class CodexRpcClient(
         ): String? {
             val cursor = returnedCursor?.takeIf(String::isNotBlank) ?: return null
             if (cursor in consumedCursors) {
-                throw RpcException("thread/turns/list 返回了重复的 nextCursor")
+                throw RpcException("thread/turns/list returned a duplicate nextCursor")
             }
             return cursor
         }
@@ -1291,8 +1593,8 @@ class CodexRpcClient(
 
         internal fun parseTimelineItem(element: JsonElement): TimelineItem? {
             val item = element.asObject() ?: return null
-            val type = item.string("type") ?: return null
-            val id = item.string("id") ?: "$type-${item.hashCode()}"
+            val type = item.strictString("type")?.takeIf(String::isNotBlank) ?: return null
+            val id = item.strictString("id")?.takeIf(String::isNotBlank) ?: return null
             return when (type) {
                 "userMessage" -> TimelineItem(
                     id,
@@ -1313,11 +1615,11 @@ class CodexRpcClient(
                 "reasoning" -> TimelineItem(
                     id,
                     TimelineKind.REASONING,
-                    title = "思考过程",
+                    title = "Reasoning",
                     body = (item.array("summary").ifEmpty { item.array("content") })
                         .joinToString("\n") { it.jsonPrimitive.contentOrNull.orEmpty() },
                 )
-                "plan" -> TimelineItem(id, TimelineKind.PLAN, title = "计划", body = item.string("text").orEmpty())
+                "plan" -> TimelineItem(id, TimelineKind.PLAN, title = "Plan", body = item.string("text").orEmpty())
                 "commandExecution" -> TimelineItem(
                     id,
                     TimelineKind.COMMAND,
@@ -1326,24 +1628,15 @@ class CodexRpcClient(
                     status = item.string("status").orEmpty(),
                 )
                 "fileChange" -> {
-                    val changes = item.array("changes").mapNotNull { changeElement ->
-                        val change = changeElement.asObject() ?: return@mapNotNull null
-                        val path = change.string("path")?.takeIf(String::isNotBlank) ?: return@mapNotNull null
-                        val kind = change.obj("kind")?.string("type")
-                            ?: change.string("kind")
-                            ?: "update"
-                        FileChangeSummary(
-                            path = path,
-                            kind = kind,
-                            diff = change.string("diff").orEmpty(),
-                        )
-                    }
+                    val changeElements = item["changes"] as? JsonArray
+                    val changes = changeElements.orEmpty().mapNotNull(::parseTimelineFileChange)
                     TimelineItem(
                         id,
                         TimelineKind.FILE_CHANGE,
                         title = changes.joinToString(", ") { it.path },
                         status = item.string("status").orEmpty(),
                         fileChanges = changes,
+                        fileChangesComplete = changeElements != null && changes.size == changeElements.size,
                     )
                 }
                 "mcpToolCall", "dynamicToolCall", "collabAgentToolCall" -> TimelineItem(
@@ -1402,7 +1695,7 @@ class CodexRpcClient(
         val id = item.string("id") ?: return null
         return RemoteThread(
             id = id,
-            title = item.string("name") ?: item.string("preview")?.take(80).orEmpty().ifBlank { "新会话" },
+            title = item.string("name") ?: item.string("preview")?.take(80).orEmpty().ifBlank { "New task" },
             cwd = item.string("cwd").orEmpty(),
             updatedAt = item["updatedAt"]?.jsonPrimitive?.longOrNull ?: 0,
             isPinned = item.boolean("isPinned"),
@@ -1421,6 +1714,613 @@ class CodexRpcClient(
         transport.close()
     }
 }
+
+private val APPROVAL_JSON = Json { ignoreUnknownKeys = true; explicitNulls = false }
+
+internal const val MAX_APP_SERVER_LINE_CHARS = 8 * 1024 * 1024
+internal const val MAX_APPROVAL_MESSAGE_CHARS = 512L * 1024L
+internal const val MAX_APPROVAL_QUESTIONS = 3
+internal const val MAX_APPROVAL_OPTIONS_PER_QUESTION = 32
+internal const val MAX_TRACKED_APPROVAL_REQUESTS = 256
+internal const val MAX_TRACKED_APPROVAL_ID_CHARS = 1L * 1024L * 1024L
+internal const val MAX_TRACKED_APPROVAL_RETAINED_CHARS = 4L * 1024L * 1024L
+private const val MAX_DIAGNOSTIC_CHARS = 4_096
+
+private val NEW_COMMAND_APPROVAL_KEYS = setOf(
+    "additionalPermissions",
+    "approvalId",
+    "availableDecisions",
+    "command",
+    "commandActions",
+    "cwd",
+    "environmentId",
+    "itemId",
+    "networkApprovalContext",
+    "proposedExecpolicyAmendment",
+    "proposedNetworkPolicyAmendments",
+    "reason",
+    "startedAtMs",
+    "threadId",
+    "turnId",
+)
+
+private val LEGACY_COMMAND_APPROVAL_KEYS = setOf(
+    "approvalId",
+    "callId",
+    "command",
+    "conversationId",
+    "cwd",
+    "parsedCmd",
+    "reason",
+)
+
+private val NEW_FILE_APPROVAL_KEYS = setOf(
+    "grantRoot",
+    "itemId",
+    "reason",
+    "startedAtMs",
+    "threadId",
+    "turnId",
+)
+
+private val LEGACY_FILE_APPROVAL_KEYS = setOf(
+    "callId",
+    "conversationId",
+    "fileChanges",
+    "grantRoot",
+    "reason",
+)
+
+private val PERMISSION_APPROVAL_KEYS = setOf(
+    "cwd",
+    "environmentId",
+    "itemId",
+    "permissions",
+    "reason",
+    "startedAtMs",
+    "threadId",
+    "turnId",
+)
+
+private val USER_INPUT_REQUEST_KEYS = setOf(
+    "autoResolutionMs",
+    "isBlocking",
+    "itemId",
+    "questions",
+    "threadId",
+    "turnId",
+)
+
+private val SUPPORTED_APPROVAL_DECISIONS = setOf("accept", "acceptForSession", "decline", "cancel")
+
+private fun parseCommandApprovalRequest(
+    id: RpcRequestId,
+    method: String,
+    params: JsonObject,
+    rawParams: String,
+): ApprovalRequest {
+    val legacy = method == "execCommandApproval"
+    val allowedKeys = if (legacy) LEGACY_COMMAND_APPROVAL_KEYS else NEW_COMMAND_APPROVAL_KEYS
+    val unknown = params.unknownFields(allowedKeys)
+    val threadId = params.strictString(if (legacy) "conversationId" else "threadId")
+    val turnId = params.strictString("turnId")
+    val itemId = params.strictString(if (legacy) "callId" else "itemId")
+    val cwd = params.strictString("cwd")
+    val command = params["command"].approvalDisplayValue()
+    val requiredContextPresent = if (legacy) {
+        !threadId.isNullOrBlank() && !itemId.isNullOrBlank() && !cwd.isNullOrBlank() &&
+            params["command"].isStringArray() && params["parsedCmd"].isValidLegacyParsedCommands()
+    } else {
+        !threadId.isNullOrBlank() && !turnId.isNullOrBlank() && !itemId.isNullOrBlank() &&
+            params["startedAtMs"].isJsonLong() && !params.strictString("command").isNullOrBlank() &&
+            !cwd.isNullOrBlank()
+    }
+    val permissionsValid = params["additionalPermissions"].isNullOrValidPermissionProfile()
+    val availableDecisionsValid = params["availableDecisions"].isNullOrValidAvailableDecisions()
+    val commandActionsValid = legacy || params["commandActions"].isNullOrValidCommandActions()
+    val networkContextValid = legacy || params["networkApprovalContext"].isNullOrValidNetworkApprovalContext()
+    val execPolicyValid = legacy || params["proposedExecpolicyAmendment"].isNullOrStringArray()
+    val networkPolicyValid = legacy || params["proposedNetworkPolicyAmendments"].isNullOrValidNetworkPolicyAmendments()
+    val securityContextComplete = requiredContextPresent && permissionsValid &&
+        availableDecisionsValid && commandActionsValid && networkContextValid && execPolicyValid &&
+        networkPolicyValid && params.hasValidOptionalStrings(
+            if (legacy) setOf("approvalId", "reason")
+            else setOf("approvalId", "command", "cwd", "environmentId", "reason"),
+        ) && unknown == null
+    val context = buildList {
+        add(ApprovalContextField("Working directory", cwd ?: "Not provided"))
+        addContext("Reason", params.string("reason"))
+        addContext("Thread", threadId)
+        addContext("Turn", turnId)
+        addContext("Item", itemId)
+        addContext("Approval callback", params.string("approvalId"))
+        addContext("Started at (ms)", (params["startedAtMs"] as? JsonPrimitive)?.longOrNull?.toString())
+        addContext("Environment", params.string("environmentId"))
+        addJsonContext("Parsed command actions", params[if (legacy) "parsedCmd" else "commandActions"])
+        addJsonContext("Available decisions", params["availableDecisions"])
+        addJsonContext("Additional permissions", params["additionalPermissions"])
+        addJsonContext("Network request", params["networkApprovalContext"])
+        addJsonContext("Exec policy amendment", params["proposedExecpolicyAmendment"])
+        addJsonContext("Network policy amendments", params["proposedNetworkPolicyAmendments"])
+        addJsonContext("Unrecognized request data", unknown)
+        if (!securityContextComplete) {
+            add(ApprovalContextField("Validation warning", APPROVAL_VALIDATION_WARNING))
+        }
+    }
+    return ApprovalRequest(
+        requestId = id,
+        kind = ApprovalKind.COMMAND,
+        title = "Allow command execution?",
+        detail = command ?: params.string("reason") ?: "Remote Codex requests command execution",
+        rawMethod = method,
+        rawParams = rawParams,
+        threadId = threadId,
+        turnId = turnId,
+        itemId = itemId,
+        approvalId = params.strictString("approvalId"),
+        startedAtMs = (params["startedAtMs"] as? JsonPrimitive)?.longOrNull,
+        cwd = cwd,
+        context = context,
+        availableDecisions = params.approvalDecisions(ApprovalKind.COMMAND, securityContextComplete),
+        securityContextComplete = securityContextComplete,
+    )
+}
+
+private fun parseFileApprovalRequest(
+    id: RpcRequestId,
+    method: String,
+    params: JsonObject,
+    rawParams: String,
+): ApprovalRequest {
+    val legacy = method == "applyPatchApproval"
+    val allowedKeys = if (legacy) LEGACY_FILE_APPROVAL_KEYS else NEW_FILE_APPROVAL_KEYS
+    val unknown = params.unknownFields(allowedKeys)
+    val threadId = params.strictString(if (legacy) "conversationId" else "threadId")
+    val turnId = params.strictString("turnId")
+    val itemId = params.strictString(if (legacy) "callId" else "itemId")
+    val (fileChanges, fileChangesValid) = if (legacy) params.parseLegacyFileChanges() else emptyList<FileChangeSummary>() to true
+    val requiredContextPresent = if (legacy) {
+        !threadId.isNullOrBlank() && !itemId.isNullOrBlank() && params["fileChanges"] is JsonObject
+    } else {
+        !threadId.isNullOrBlank() && !turnId.isNullOrBlank() && !itemId.isNullOrBlank() &&
+            params["startedAtMs"].isJsonLong()
+    }
+    val securityContextComplete = requiredContextPresent && fileChangesValid &&
+        params.hasValidOptionalStrings(setOf("grantRoot", "reason")) && unknown == null
+    val context = buildList {
+        addContext("Reason", params.string("reason"))
+        addContext("Session write root", params.string("grantRoot"))
+        addContext("Thread", threadId)
+        addContext("Turn", turnId)
+        addContext("Item", itemId)
+        addContext("Started at (ms)", (params["startedAtMs"] as? JsonPrimitive)?.longOrNull?.toString())
+        addJsonContext("Unrecognized request data", unknown)
+        if (!securityContextComplete) {
+            add(ApprovalContextField("Validation warning", APPROVAL_VALIDATION_WARNING))
+        }
+    }
+    return ApprovalRequest(
+        requestId = id,
+        kind = ApprovalKind.FILE_CHANGE,
+        title = "Allow file changes?",
+        detail = params.string("reason") ?: params.string("grantRoot") ?: "Remote Codex requests write access to the project",
+        rawMethod = method,
+        rawParams = rawParams,
+        threadId = threadId,
+        turnId = turnId,
+        itemId = itemId,
+        startedAtMs = (params["startedAtMs"] as? JsonPrimitive)?.longOrNull,
+        context = context,
+        fileChanges = fileChanges,
+        availableDecisions = params.approvalDecisions(ApprovalKind.FILE_CHANGE, securityContextComplete),
+        securityContextComplete = securityContextComplete,
+    )
+}
+
+private fun parsePermissionApprovalRequest(
+    id: RpcRequestId,
+    method: String,
+    params: JsonObject,
+    rawParams: String,
+): ApprovalRequest {
+    val unknown = params.unknownFields(PERMISSION_APPROVAL_KEYS)
+    val threadId = params.strictString("threadId")
+    val turnId = params.strictString("turnId")
+    val itemId = params.strictString("itemId")
+    val cwd = params.strictString("cwd")
+    val permissions = params["permissions"]
+    val securityContextComplete = !threadId.isNullOrBlank() && !turnId.isNullOrBlank() &&
+        !itemId.isNullOrBlank() && !cwd.isNullOrBlank() &&
+        params["startedAtMs"].isJsonLong() &&
+        permissions is JsonObject && permissions.isValidPermissionProfile() &&
+        params.hasValidOptionalStrings(setOf("environmentId", "reason")) && unknown == null
+    val context = buildList {
+        addContext("Working directory", cwd)
+        addContext("Reason", params.string("reason"))
+        addContext("Thread", threadId)
+        addContext("Turn", turnId)
+        addContext("Item", itemId)
+        addContext("Started at (ms)", (params["startedAtMs"] as? JsonPrimitive)?.longOrNull?.toString())
+        addContext("Environment", params.string("environmentId"))
+        addJsonContext("Requested permissions", permissions)
+        addJsonContext("Unrecognized request data", unknown)
+        if (!securityContextComplete) {
+            add(ApprovalContextField("Validation warning", APPROVAL_VALIDATION_WARNING))
+        }
+    }
+    return ApprovalRequest(
+        requestId = id,
+        kind = ApprovalKind.PERMISSION,
+        title = "Allow additional permissions?",
+        detail = params.string("reason") ?: "Remote Codex requests additional file or network permissions",
+        rawMethod = method,
+        rawParams = rawParams,
+        threadId = threadId,
+        turnId = turnId,
+        itemId = itemId,
+        startedAtMs = (params["startedAtMs"] as? JsonPrimitive)?.longOrNull,
+        cwd = cwd,
+        context = context,
+        availableDecisions = params.approvalDecisions(ApprovalKind.PERMISSION, securityContextComplete),
+        securityContextComplete = securityContextComplete,
+    )
+}
+
+private fun parseUserInputRequest(
+    id: RpcRequestId,
+    method: String,
+    params: JsonObject,
+    rawParams: String,
+): ApprovalRequest {
+    val unknown = params.unknownFields(USER_INPUT_REQUEST_KEYS)
+    val questionElements = params["questions"] as? JsonArray
+    val boundedQuestionElements = questionElements?.takeIf { it.size in 1..MAX_APPROVAL_QUESTIONS }
+    val questions = boundedQuestionElements.orEmpty().mapNotNull(::parseApprovalQuestion)
+    val isBlockingValid = (params["isBlocking"] as? JsonPrimitive)
+        ?.takeUnless(JsonPrimitive::isString)
+        ?.contentOrNull
+        ?.toBooleanStrictOrNull() != null
+    val autoResolution = params["autoResolutionMs"]
+    val autoResolutionValid = autoResolution == null || autoResolution is JsonNull ||
+        autoResolution.isJsonLong() && autoResolution.jsonPrimitive.longOrNull!! >= 0L
+    val securityContextComplete = boundedQuestionElements != null && questions.isNotEmpty() &&
+        questions.size == boundedQuestionElements.size &&
+        questions.map(ApprovalQuestion::id).distinct().size == questions.size &&
+        isBlockingValid && autoResolutionValid && unknown == null &&
+        !params.strictString("threadId").isNullOrBlank() &&
+        !params.strictString("turnId").isNullOrBlank() && !params.strictString("itemId").isNullOrBlank()
+    return ApprovalRequest(
+        requestId = id,
+        kind = ApprovalKind.USER_INPUT,
+        title = questions.firstOrNull()?.header?.ifBlank { null } ?: "Codex needs your input",
+        detail = questions.firstOrNull()?.question ?: "Enter a reply",
+        rawMethod = method,
+        rawParams = rawParams,
+        questions = questions,
+        threadId = params.strictString("threadId"),
+        turnId = params.strictString("turnId"),
+        itemId = params.strictString("itemId"),
+        availableDecisions = if (securityContextComplete) listOf("accept") else emptyList(),
+        securityContextComplete = securityContextComplete,
+    )
+}
+
+private fun approvalDecisionElement(method: String, decision: String): JsonElement {
+    if (method != "execCommandApproval" && method != "applyPatchApproval") return JsonPrimitive(decision)
+    return when (decision) {
+        "accept" -> JsonPrimitive("approved")
+        "acceptForSession" -> JsonPrimitive("approved_for_session")
+        "decline" -> buildJsonObject {
+            put("denied", buildJsonObject { put("rejection", "Denied by user") })
+        }
+        "cancel" -> JsonPrimitive("abort")
+        else -> JsonPrimitive(decision)
+    }
+}
+
+private fun JsonObject.approvalDecisions(
+    kind: ApprovalKind,
+    securityContextComplete: Boolean,
+): List<String> {
+    val advertised = this["availableDecisions"]
+    val decisions = if (advertised == null || advertised is JsonNull) {
+        com.codex.remote.domain.defaultApprovalDecisions(kind)
+    } else {
+        (advertised as? JsonArray).orEmpty()
+            .mapNotNull { (it as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.contentOrNull }
+            .filter { it in SUPPORTED_APPROVAL_DECISIONS }
+            .distinct()
+    }
+    return if (securityContextComplete) decisions else decisions.filterNot { it.startsWith("accept") }
+}
+
+private fun JsonObject.parseLegacyFileChanges(): Pair<List<FileChangeSummary>, Boolean> {
+    val changes = obj("fileChanges") ?: return emptyList<FileChangeSummary>() to false
+    if (changes.isEmpty()) return emptyList<FileChangeSummary>() to false
+    val parsed = mutableListOf<FileChangeSummary>()
+    for ((path, element) in changes) {
+        if (path.isBlank()) return emptyList<FileChangeSummary>() to false
+        val change = element.asObject() ?: return emptyList<FileChangeSummary>() to false
+        val kind = change.strictString("type") ?: return emptyList<FileChangeSummary>() to false
+        val (diff, movePath) = when (kind) {
+            "update" -> {
+                if (change.keys.any { it !in setOf("type", "unified_diff", "move_path") }) {
+                    return emptyList<FileChangeSummary>() to false
+                }
+                val diff = change.strictString("unified_diff")
+                    ?: return emptyList<FileChangeSummary>() to false
+                val rawMovePath = change["move_path"]
+                val movePath = when (rawMovePath) {
+                    null, JsonNull -> null
+                    is JsonPrimitive -> rawMovePath.takeIf(JsonPrimitive::isString)?.contentOrNull
+                        ?.takeIf(String::isNotBlank)
+                        ?: return emptyList<FileChangeSummary>() to false
+                    else -> return emptyList<FileChangeSummary>() to false
+                }
+                diff to movePath
+            }
+            "add", "delete" -> {
+                if (change.keys != setOf("type", "content")) {
+                    return emptyList<FileChangeSummary>() to false
+                }
+                val diff = change.strictString("content")
+                    ?: return emptyList<FileChangeSummary>() to false
+                diff to null
+            }
+            else -> return emptyList<FileChangeSummary>() to false
+        }
+        parsed += FileChangeSummary(path = path, kind = kind, diff = diff, movePath = movePath)
+    }
+    return parsed to true
+}
+
+private fun parseTimelineFileChange(element: JsonElement): FileChangeSummary? {
+    val change = element.asObject() ?: return null
+    if (change.keys != setOf("diff", "kind", "path")) return null
+    val path = change.strictString("path")?.takeIf(String::isNotBlank) ?: return null
+    val diff = change.strictString("diff") ?: return null
+    val kind = change.obj("kind") ?: return null
+    val kindType = kind.strictString("type") ?: return null
+    val movePath = when (kindType) {
+        "add", "delete" -> {
+            if (kind.keys != setOf("type")) return null
+            null
+        }
+        "update" -> {
+            if (kind.keys.any { it !in setOf("type", "move_path") }) return null
+            val rawMovePath = kind["move_path"]
+            when (rawMovePath) {
+                null, JsonNull -> null
+                is JsonPrimitive -> rawMovePath.takeIf(JsonPrimitive::isString)?.contentOrNull
+                    ?.takeIf(String::isNotBlank)
+                    ?: return null
+                else -> return null
+            }
+        }
+        else -> return null
+    }
+    return FileChangeSummary(path = path, kind = kindType, diff = diff, movePath = movePath)
+}
+
+private fun JsonElement?.isStringArray(): Boolean =
+    this is JsonArray && all { it is JsonPrimitive && it.isString }
+
+private fun JsonElement?.isNullOrStringArray(): Boolean =
+    this == null || this is JsonNull || isStringArray()
+
+private fun JsonElement?.isNullOrValidCommandActions(): Boolean = when (this) {
+    null, JsonNull -> true
+    is JsonArray -> all { element ->
+        val command = element.asObject() ?: return@all false
+        val type = command.strictString("type") ?: return@all false
+        if (command.strictString("command") == null) return@all false
+        when (type) {
+            "read" -> command.keys == setOf("command", "name", "path", "type") &&
+                command.strictString("name") != null && command.strictString("path") != null
+            "listFiles" -> command.keys.all { it in setOf("command", "path", "type") } &&
+                command.hasValidOptionalStrings(setOf("path"))
+            "search" -> command.keys.all { it in setOf("command", "path", "query", "type") } &&
+                command.hasValidOptionalStrings(setOf("path", "query"))
+            "unknown" -> command.keys == setOf("command", "type")
+            else -> false
+        }
+    }
+    else -> false
+}
+
+private fun JsonElement?.isNullOrValidNetworkApprovalContext(): Boolean = when (this) {
+    null, JsonNull -> true
+    is JsonObject -> keys == setOf("host", "protocol") &&
+        !strictString("host").isNullOrBlank() &&
+        strictString("protocol") in setOf("http", "https", "socks5Tcp", "socks5Udp")
+    else -> false
+}
+
+private fun JsonElement?.isNullOrValidNetworkPolicyAmendments(): Boolean = when (this) {
+    null, JsonNull -> true
+    is JsonArray -> all { element ->
+        val amendment = element.asObject() ?: return@all false
+        amendment.keys == setOf("action", "host") &&
+            amendment.strictString("action") in setOf("allow", "deny") &&
+            !amendment.strictString("host").isNullOrBlank()
+    }
+    else -> false
+}
+
+private fun JsonElement?.isValidLegacyParsedCommands(): Boolean {
+    val commands = this as? JsonArray ?: return false
+    return commands.all { element ->
+        val command = element.asObject() ?: return@all false
+        val type = command.strictString("type") ?: return@all false
+        if (command.strictString("cmd") == null) return@all false
+        when (type) {
+            "read" -> command.keys == setOf("cmd", "name", "path", "type") &&
+                command.strictString("name") != null && command.strictString("path") != null
+            "list_files" -> command.keys.all { it in setOf("cmd", "path", "type") } &&
+                command.hasValidOptionalStrings(setOf("path"))
+            "search" -> command.keys.all { it in setOf("cmd", "path", "query", "type") } &&
+                command.hasValidOptionalStrings(setOf("path", "query"))
+            "unknown" -> command.keys == setOf("cmd", "type")
+            else -> false
+        }
+    }
+}
+
+private fun JsonElement?.isNullOrValidAvailableDecisions(): Boolean = when (this) {
+    null, JsonNull -> true
+    is JsonArray -> all(JsonElement::isValidAvailableDecision)
+    else -> false
+}
+
+private fun JsonElement.isValidAvailableDecision(): Boolean = when (this) {
+    is JsonPrimitive -> isString && contentOrNull in SUPPORTED_APPROVAL_DECISIONS
+    is JsonObject -> when {
+        keys == setOf("acceptWithExecpolicyAmendment") -> {
+            val wrapper = obj("acceptWithExecpolicyAmendment")
+            val amendment = wrapper?.get("execpolicy_amendment")
+            wrapper?.keys == setOf("execpolicy_amendment") && amendment.isStringArray()
+        }
+        keys == setOf("applyNetworkPolicyAmendment") -> {
+            val wrapper = obj("applyNetworkPolicyAmendment")
+            val amendment = wrapper?.obj("network_policy_amendment")
+            wrapper?.keys == setOf("network_policy_amendment") &&
+                amendment?.keys == setOf("action", "host") &&
+                amendment.strictString("action") in setOf("allow", "deny") &&
+                amendment.strictString("host") != null
+        }
+        else -> false
+    }
+    else -> false
+}
+
+private fun parseApprovalQuestion(element: JsonElement): ApprovalQuestion? {
+    val question = element.asObject() ?: return null
+    if (question.keys.any { it !in setOf("header", "id", "isOther", "isSecret", "options", "question") }) {
+        return null
+    }
+    val id = question.strictString("id")?.takeIf(String::isNotBlank) ?: return null
+    val header = question.strictString("header") ?: return null
+    val prompt = question.strictString("question")?.takeIf(String::isNotBlank) ?: return null
+    val isOther = question.strictBoolean("isOther") ?: return null
+    val isSecret = question.strictBoolean("isSecret") ?: return null
+    if (isSecret) return null
+    if (!question.containsKey("options")) return null
+    val optionsElement = question["options"]
+    val options = when (optionsElement) {
+        null, JsonNull -> emptyList()
+        is JsonArray -> {
+            if (optionsElement.size > MAX_APPROVAL_OPTIONS_PER_QUESTION) return null
+            optionsElement.mapNotNull { optionElement ->
+                val option = optionElement.asObject() ?: return null
+                if (option.keys != setOf("description", "label")) return null
+                ApprovalOption(
+                    description = option.strictString("description") ?: return null,
+                    label = option.strictString("label")?.takeIf(String::isNotBlank) ?: return null,
+                )
+            }
+        }
+        else -> return null
+    }
+    if (options.map(ApprovalOption::label).distinct().size != options.size) return null
+    return ApprovalQuestion(id = id, header = header, question = prompt, isOther = isOther, options = options)
+}
+
+private fun JsonObject.strictBoolean(key: String): Boolean? = (this[key] as? JsonPrimitive)
+    ?.takeUnless(JsonPrimitive::isString)
+    ?.contentOrNull
+    ?.toBooleanStrictOrNull()
+
+private fun JsonObject.unknownFields(allowedKeys: Set<String>): JsonObject? {
+    val values = entries.filter { it.key !in allowedKeys }.associate { it.toPair() }
+    return if (values.isEmpty()) null else JsonObject(values)
+}
+
+private fun JsonElement?.approvalDisplayValue(): String? = when (this) {
+    null, JsonNull -> null
+    is JsonPrimitive -> contentOrNull
+    is JsonArray -> toString()
+    else -> toString()
+}
+
+private fun MutableList<ApprovalContextField>.addContext(label: String, value: String?) {
+    value?.takeIf(String::isNotBlank)?.let { add(ApprovalContextField(label, it)) }
+}
+
+private fun MutableList<ApprovalContextField>.addJsonContext(label: String, value: JsonElement?) {
+    if (value != null && value !is JsonNull) add(ApprovalContextField(label, value.toString()))
+}
+
+private fun JsonElement?.isNullOrValidPermissionProfile(): Boolean =
+    this == null || this is JsonNull || (this as? JsonObject)?.isValidPermissionProfile() == true
+
+private fun JsonObject.isValidPermissionProfile(): Boolean {
+    if (keys.any { it !in setOf("fileSystem", "network") }) return false
+    val fileSystem = this["fileSystem"]
+    if (fileSystem != null && fileSystem !is JsonNull &&
+        (fileSystem as? JsonObject)?.isValidFileSystemPermissions() != true
+    ) return false
+    val network = this["network"]
+    if (network != null && network !is JsonNull &&
+        (network as? JsonObject)?.isValidNetworkPermissions() != true
+    ) return false
+    return true
+}
+
+private fun JsonObject.isValidFileSystemPermissions(): Boolean {
+    if (keys.any { it !in setOf("entries", "globScanMaxDepth", "read", "write") }) return false
+    val entries = this["entries"]
+    if (entries != null && entries !is JsonNull) {
+        val array = entries as? JsonArray ?: return false
+        if (array.any { (it as? JsonObject)?.isValidFileSystemEntry() != true }) return false
+    }
+    for (key in listOf("read", "write")) {
+        val value = this[key]
+        if (value != null && value !is JsonNull) {
+            val array = value as? JsonArray ?: return false
+            if (array.any { it !is JsonPrimitive || !it.isString }) return false
+        }
+    }
+    val maxDepth = this["globScanMaxDepth"]
+    if (maxDepth != null && maxDepth !is JsonNull &&
+        (maxDepth as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)
+            ?.longOrNull?.let { it in 1..UInt.MAX_VALUE.toLong() } != true
+    ) return false
+    return true
+}
+
+private fun JsonObject.isValidNetworkPermissions(): Boolean {
+    if (keys.any { it != "enabled" }) return false
+    val enabled = this["enabled"] ?: return true
+    if (enabled is JsonNull) return true
+    return enabled is JsonPrimitive && !enabled.isString &&
+        enabled.contentOrNull?.toBooleanStrictOrNull() != null
+}
+
+private fun JsonObject.isValidFileSystemEntry(): Boolean {
+    if (keys != setOf("access", "path")) return false
+    if (strictString("access") !in setOf("read", "write", "deny")) return false
+    return (this["path"] as? JsonObject)?.isValidFileSystemPath() == true
+}
+
+private fun JsonObject.isValidFileSystemPath(): Boolean = when (strictString("type")) {
+    "path" -> keys == setOf("type", "path") && !strictString("path").isNullOrBlank()
+    "glob_pattern" -> keys == setOf("type", "pattern") && !strictString("pattern").isNullOrBlank()
+    "special" -> keys == setOf("type", "value") &&
+        (this["value"] as? JsonObject)?.isValidSpecialFileSystemPath() == true
+    else -> false
+}
+
+private fun JsonObject.isValidSpecialFileSystemPath(): Boolean = when (strictString("kind")) {
+    "root", "minimal", "tmpdir", "slash_tmp" -> keys == setOf("kind")
+    "project_roots" -> keys.all { it in setOf("kind", "subpath") } &&
+        (this["subpath"] == null || this["subpath"] is JsonNull || strictString("subpath") != null)
+    "unknown" -> keys.all { it in setOf("kind", "path", "subpath") } && !strictString("path").isNullOrBlank() &&
+        (this["subpath"] == null || this["subpath"] is JsonNull || strictString("subpath") != null)
+    else -> false
+}
+
+private const val APPROVAL_VALIDATION_WARNING =
+    "Request contains missing, malformed, or unrecognized security fields. Only denial is allowed."
 
 internal data class ThreadPage(
     val threads: List<RemoteThread>,
@@ -1446,7 +2346,7 @@ internal suspend fun collectAllThreadPages(
         }
         cursor = page.nextCursor?.takeIf(String::isNotBlank)
         if (cursor != null && !usedCursors.add(cursor)) {
-            throw RpcException("thread/list 返回了重复的 nextCursor")
+            throw RpcException("thread/list returned a duplicate nextCursor")
         }
     } while (cursor != null)
     return threadsById.values.sortedWith(compareByDescending<RemoteThread> { it.updatedAt }.thenBy { it.id })
@@ -1463,7 +2363,7 @@ internal suspend fun collectAllModelPages(
         page.models.forEach { model -> modelsById[model.id] = model }
         cursor = page.nextCursor?.takeIf(String::isNotBlank)
         if (cursor != null && !usedCursors.add(cursor)) {
-            throw RpcException("model/list 返回了重复的 nextCursor")
+            throw RpcException("model/list returned a duplicate nextCursor")
         }
     } while (cursor != null)
     return modelsById.values.toList()
@@ -1497,6 +2397,14 @@ private fun JsonElement.asObject(): JsonObject? = this as? JsonObject
 private fun JsonObject.obj(key: String): JsonObject? = this[key] as? JsonObject
 private fun JsonObject.array(key: String): JsonArray = this[key] as? JsonArray ?: JsonArray(emptyList())
 private fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
+private fun JsonObject.strictString(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.contentOrNull
+private fun JsonObject.hasValidOptionalStrings(keys: Set<String>): Boolean = keys.all { key ->
+    val value = this[key]
+    value == null || value is JsonNull || value is JsonPrimitive && value.isString
+}
+private fun JsonElement?.isJsonLong(): Boolean =
+    this is JsonPrimitive && !isString && longOrNull != null
 private fun JsonObject.boolean(key: String): Boolean = (this[key] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull() ?: false
 private fun JsonObject.booleanOrDefault(key: String, default: Boolean): Boolean =
     (this[key] as? JsonPrimitive)?.contentOrNull?.toBooleanStrictOrNull() ?: default

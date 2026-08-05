@@ -89,7 +89,7 @@ val block = "${'$'}stillRaw${'$'}"
         val presentation = groupConsecutiveCommands(timeline)
 
         assertEquals(3, presentation.size)
-        assertEquals("运行了多个命令", presentation[1].item.title)
+        assertEquals("Ran multiple commands", presentation[1].item.title)
         assertEquals("command-group:cmd-1", presentation[1].item.id)
         assertEquals(listOf("cmd-1", "cmd-2"), presentation[1].sourceItemIds)
         assertTrue(presentation[1].item.body.contains("1. pwd"))
