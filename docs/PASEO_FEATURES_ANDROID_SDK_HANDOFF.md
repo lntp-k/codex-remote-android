@@ -1,10 +1,12 @@
 # Codex Remote: Paseo-inspired features and Android SDK handoff
 
-- Status: proposed and ready for implementation handoff
+- Status: Phase 0 automated migration and Phase 1 implemented; Phase 2a partial
 - Prepared: 2026-08-06 (Asia/Seoul)
 - Repository: `lntp-k/codex-remote-android`
 - Baseline commit: `c2b5e60fecc37bb8d95c52d082da06031f87187c`
 - Baseline release: `0.1.6` (`versionCode = 7`)
+- Implementation branch: `agent/paseo-android16-session-registry`
+- Current committed implementation tip: `d9cd9f1` (`Implement bounded multi-session routing`)
 
 ## 0. 한국어 요약
 
@@ -12,15 +14,23 @@
 아니라, 현재의 **Android -> SSH -> 원격 Codex** 직접 연결 구조를
 유지하면서 체감 가치가 큰 기능을 선별해 추가하는 것이다.
 
-구현 순서는 다음과 같이 고정한다.
+현재 이 계획은 제안 단계를 지나 다음 범위까지 구현되었다.
 
-1. Android 빌드 도구를 AGP 8.13.2와 Gradle 8.13으로 올린다.
-2. `compileSdk`와 `targetSdk`를 각각 별도 단계로 API 36까지 올린다.
-3. 선택된 한 세션 중심의 상태 구조를 세션별 상태 저장소로 분리한다.
-4. 멀티 세션 대시보드와 통합 승인함을 추가한다.
-5. 명시적인 Workspace와 안전한 Git worktree 관리를 추가한다.
-6. 연결 복구와 원격 지속 실행을 검증한 뒤 터미널을 추가한다.
-7. 마지막으로 파일별 Git diff, 검토, commit/revert UI를 추가한다.
+1. AGP 8.13.2, Gradle 8.13, `compileSdk = 36`, `targetSdk = 36`으로
+   각각 분리된 커밋을 통해 마이그레이션했다.
+2. `SessionRegistry`, `SessionState`, `SessionEventRouter`,
+   `SessionRequestTracker`로 선택된 한 세션 중심의 상태 구조를 분리했다.
+3. 정확한 thread/turn 소유권, 교차 세션 이벤트 차단, 세션별 승인 큐,
+   캐시·히스토리의 개별/합계 보존 한도를 구현했다.
+4. 사이드바 세션 상태 표시와 전역 순차 승인 표시를 추가했다. 다른
+   세션의 승인은 소유 작업을 열기 전에는 허용할 수 없고 거부만 가능하다.
+
+아직 완성되지 않은 다음 단계는 완전한 멀티 세션 대시보드/통합 승인함,
+명시적 Workspace·worktree, 지속 실행/복구, 터미널, 풍부한 Git 검토이다.
+서명된 릴리스, 기존 `0.1.6` 위 업그레이드, 실제 Android 기기, 실제 SSH,
+Android instrumentation 런타임 검증도 완료되지 않았다. 현재 자동 검증
+산출물과 최종 clean build 수치는
+`docs/verification/ANDROID_16_MIGRATION.md`에 기록한다.
 
 Android 17/API 37은 아직 운영 대상으로 삼지 않는다. 특히 사설 IP,
 Tailscale 주소, 로컬 네트워크 권한 변화가 직접 SSH 연결에 미치는
@@ -51,6 +61,21 @@ The product boundary remains deliberately narrower than Paseo:
 The intended result is approximately 70% of Paseo's useful workflow for this
 use case without inheriting its full relay, provider-adapter, and daemon
 complexity.
+
+### Implementation status at this handoff
+
+| Scope | Status | Evidence boundary |
+| --- | --- | --- |
+| Phase 0B: AGP 8.13.2 / Gradle 8.13 / JDK 17 | Implemented | Final local ARM64 clean gate passed: 212 JVM tests, lint, three APK builds, R8 mapping, integrity/signature/alignment checks. |
+| Phase 0C: compile against API 36 | Implemented | `compileSdk = 36`; no physical-device claim. |
+| Phase 0D: target API 36 | Implemented in source | `targetSdk = 36`; Android 14/15/16 behavior and upgrade installation remain unverified. |
+| Phase 1: per-session state and exact event routing | Implemented | JVM routing, bounds, ownership, parsing, projection, and request-race regressions exist. |
+| Phase 2a: visible supervision | Partial | Per-thread indicators and one global sequential approval surface exist; no full dashboard, grouped inbox, notification deep link, or process-recreation claim. |
+| Phases 3-7 | Not implemented | Workspace/worktree, persistence, terminal, rich Git review, and optional integrations remain roadmap items. |
+
+"Implemented" in this table means source plus automated checks, not a shipped
+or device-validated release. The unsigned CI release artifact is deliberately
+non-distributable.
 
 ## 2. Decisions already made
 
@@ -87,16 +112,16 @@ complexity.
 - Worktree at handoff: `graphify-out/` is untracked; it predates this document
   and must not be committed accidentally without a separate decision.
 
-### 3.2 Current Android build
+### 3.2 Android build migration state
 
-| Component | Current | Planned production baseline |
+| Component | Original baseline | Current branch |
 | --- | --- | --- |
 | `compileSdk` | 35 | 36 |
 | `targetSdk` | 35 | 36 |
 | `minSdk` | 26 | 26 |
 | Android Gradle Plugin | 8.7.3 | 8.13.2 |
 | Gradle wrapper | 8.10.2 | 8.13 |
-| Kotlin plugins | 2.0.21 | retain initially |
+| Kotlin plugins | 2.0.21 | 2.0.21 |
 | JVM/JDK target | 17 | 17 |
 
 Do not combine a Kotlin, Compose BOM, SSHJ, coroutine, or serialization upgrade
@@ -117,18 +142,26 @@ The app already supports host-wide thread discovery, cursor pagination,
 project grouping by `cwd`, thread resume, streaming, approvals, goals, model and
 permission selection, MCP status/OAuth, and remote Codex authentication.
 
-### 3.4 Architectural constraint to remove first
+### 3.4 Architectural constraint removed in Phase 1
 
-`AppViewModel` and `CodexRpcClient` are the two central hubs. In particular:
+The baseline routed streamed events through selected-thread UI state. The
+current branch now introduces:
 
-- `AppViewModel.observeEvents` owns a broad set of event-to-UI transitions;
-- `acceptsThreadEvent` filters streamed events against the selected thread;
-- the test `streamedEventsOnlyApplyToTheSelectedThread` records that current
-  behavior; and
-- transport lifetime is tied to the SSH app-server channel.
+- `SessionRegistry`, an immutable cache keyed by exact thread ID;
+- `SessionEventRouter`, which rejects missing/unknown thread IDs and stale or
+  ambiguous turn ownership rather than applying them to the visible session;
+- `SessionRequestTracker`, which invalidates stale connection, selection,
+  load, and turn-start continuations;
+- compatibility projection from the selected cached session into existing
+  `AppUiState`; and
+- bounded per-session and aggregate retained state with deterministic eviction
+  only for inactive, unselected, non-approval, non-running, non-active-goal
+  sessions.
 
-This is correct for a single visible session but cannot reliably represent
-several active sessions, independent approvals, or background completion.
+`AppViewModel` still owns orchestration and legacy UI projection, so this is a
+foundation rather than the end-state dashboard architecture. The SSH app-server
+transport lifetime is also still tied to the phone connection; remote
+persistence and reconnection are not implemented by this phase.
 
 ## 4. Target architecture
 
@@ -177,6 +210,10 @@ usable. Suggested release names are provisional.
 
 ### Phase 0A - Capture the baseline
 
+Status: **partially complete**. Source/build identity and automated gates are
+recorded. Physical-device, signed-release, upgrade-installation, and real SSH
+baseline evidence remain open.
+
 Purpose: make later regressions attributable.
 
 Tasks:
@@ -194,6 +231,11 @@ Acceptance criteria:
 - no debug APK is used with real production passwords or private keys.
 
 ### Phase 0B - Upgrade build tools only
+
+Status: **implemented** in commit `fc025c7`. The toolchain is AGP 8.13.2,
+Gradle 8.13, and JDK 17. Automated debug/unsigned-minified-release assembly is
+part of the current verification path. A signed production release and upgrade
+installation were not performed.
 
 Files expected to change:
 
@@ -218,6 +260,10 @@ Acceptance criteria:
 
 ### Phase 0C - Compile against API 36, still target API 35
 
+Status: **implemented as an isolated migration step** in commit `a506f64`.
+The branch subsequently advanced to Phase 0D, so its current target is no
+longer API 35.
+
 Change only `compileSdk` from 35 to 36. Resolve new compiler and lint findings
 without opting into API 36 target behavior yet.
 
@@ -232,6 +278,9 @@ Acceptance criteria:
 
 ### Phase 0D - Target API 36
 
+Status: **implemented in source** in commit `acd38eb`; device behavior remains
+unverified. This must not be described as a device-validated `0.1.7` release.
+
 Change `targetSdk` from 35 to 36 and explicitly validate Android 16 behavior:
 
 - edge-to-edge insets on every top-level screen and dialog;
@@ -245,6 +294,8 @@ Deliverable: `0.1.7-beta1` followed by a signed `0.1.7` only after device
 validation.
 
 ### Phase 1 - Per-session state and event routing
+
+Status: **implemented in the current working tree**.
 
 Purpose: remove the selected-thread bottleneck without changing the visible
 workflow first.
@@ -291,7 +342,52 @@ Acceptance criteria:
 - no user-visible multi-session claim is made until interleaving tests pass;
 - `AppViewModel` is primarily orchestration, not the owner of every transition.
 
+Implemented details and regression coverage:
+
+- exact thread-scoped routing for timeline items, deltas, turn lifecycle,
+  goals, approvals, compaction, and failure events;
+- strict app-server parsing that retains exact active-turn identity during
+  resume and rejects malformed or ambiguous ownership;
+- session-local timeline, history cursor, goal, settings, approval, running,
+  unread, and diagnostic state;
+- per-session and aggregate item/character/cursor budgets with saturating
+  accounting, atomic rejection, and deterministic eligible LRU eviction;
+- selected/running/approval-bearing/active-goal sessions protected from
+  eviction;
+- exact connection-generation and request ownership for asynchronous state;
+- target-scoped safe authorization defaults instead of carrying full access
+  across hosts or uncached sessions; and
+- tests for interleaving, stale turns, fail-closed approval ownership,
+  selection restoration, pagination/bounds, request ordering, and connection
+  invalidation.
+
+The compatibility projection means `AppViewModel` remains a large orchestrator.
+Further decomposition is desirable, but the selected-thread acceptance filter
+is no longer the authority for streamed session events.
+
 ### Phase 2 - Live multi-session dashboard and approval inbox
+
+Status: **Phase 2a partial only**.
+
+Implemented now:
+
+- per-thread running, approval-required, failed, and unread indicators in the
+  existing project/task navigation;
+- cached-session switching without assigning a neighboring timeline;
+- one global arrival-ordered approval surface;
+- exact approval owner title/path/task identity;
+- allow disabled for a background or unknown owner until the exact owning task
+  is selected, while deny remains available; and
+- an explicit action to open the owning task.
+
+Still missing:
+
+- a dedicated multi-session dashboard;
+- an inbox grouped by host/project/workspace/session;
+- bulk denial;
+- completion/approval notifications and deep links;
+- process-recreation persistence/reconciliation; and
+- runtime proof of three simultaneously active sessions on a real host/device.
 
 Add:
 
@@ -488,9 +584,17 @@ Every phase must preserve these invariants:
 - Public-key or password material never appears in logs, crash reports, or
   screenshots generated by automated tests.
 
-Run a fresh security review against the new commit before promoting any APK.
-The earlier security report was tied to an older checkout and is evidence of
-what to re-test, not proof about the new build.
+The 2026-08-06 diff scan was tied to a **pre-fix working-tree snapshot**. It
+reported four low/P3 issues: aggregate retained-state limits, authorization
+inheritance, approval-owner presentation, and superseded-connection callbacks.
+It also retained two non-security engineering defects for follow-up: resumed
+active-turn identity loss and turn-start response/notification ordering.
+
+Implementation commit `d9cd9f1` adds targeted fixes and regression tests for
+those areas. This is remediation evidence, **not a fresh post-fix security
+attestation**. Run another snapshot-pinned security scan against the final
+commit and artifact before promoting any APK. See
+`docs/verification/SECURITY_REVIEW_2026-08-06.md`.
 
 ## 9. Validation matrix
 
@@ -500,11 +604,14 @@ what to re-test, not proof about the new build.
 - interleaved multi-session event tests;
 - approval identity and fail-closed tests;
 - pagination, buffer, and scrollback bounds;
-- Compose UI tests for dashboard, approval inbox, and predictive Back;
+- Compose UI tests for approval-owner context and selected-session isolation;
+- compile the Android instrumentation test APK even when no device runner is
+  available;
 - mock app-server protocol tests;
-- real SSH bridge integration tests;
-- `lintDebug` with zero unexplained findings;
-- debug and minified signed-release assembly;
+- real SSH bridge integration tests (still pending in this handoff);
+- `lintDebug` with 0 errors and 19 categorized, recorded warnings;
+- debug, Android-test, and minified unsigned-release assembly in CI;
+- a separately authorized minified signed-release gate;
 - APK zip integrity, alignment, and v2+ signature verification.
 
 ### Android devices
@@ -546,13 +653,15 @@ Normal environment:
 ./gradlew --no-daemon --console=plain \
   :app:testDebugUnitTest \
   :app:lintDebug \
-  :app:assembleDebug
+  :app:assembleDebug \
+  :app:assembleDebugAndroidTest \
+  :app:assembleRelease
 ```
 
 Also build a signed, minified release with the four existing
 `CODEX_REMOTE_*` signing variables. Do not print those values.
 
-On DGX Spark ARM64, an earlier SDK 35 build required an explicit compatible
+On DGX Spark ARM64, the API 36 automated build uses a verified compatible
 ARM64 `aapt2` override:
 
 ```bash
@@ -560,28 +669,32 @@ ARM64 `aapt2` override:
   -Pandroid.aapt2FromMavenOverride=/toolchain/aapt2 \
   :app:testDebugUnitTest \
   :app:lintDebug \
-  :app:assembleDebug
+  :app:assembleDebug \
+  :app:assembleDebugAndroidTest \
+  :app:assembleRelease
 ```
 
-The `/toolchain/aapt2` path is not currently present in this checkout's host
-environment. Before reusing the command, provision and verify the intended
-binary and record its version and SHA-256. Do not assume that the previous
-workaround remains correct after changing AGP or SDK Build Tools.
+The disposable ARM64 build environment used `/toolchain/aapt2`, reported
+`Android Asset Packaging Tool (aapt) 2.19-`, and verified SHA-256
+`7e5ae2e1f62fc24cab14072555ffd0a1a7e1ce27e82cc1008967b835b6d8df5b`.
+The path belongs to that environment, not the repository. CI runs on x86-64
+and uses the official SDK package. Do not copy or trust a replacement binary
+without recording its complete version and digest.
 
-## 11. Recommended PR sequence
+## 11. Delivery sequence and current state
 
-| PR | Scope | Must not include |
-| --- | --- | --- |
-| 1 | Baseline verification evidence | Feature or dependency changes |
-| 2 | AGP 8.13.2 + Gradle 8.13 | SDK and Kotlin changes |
-| 3 | `compileSdk = 36` | `targetSdk` change |
-| 4 | `targetSdk = 36` + behavior fixes | Paseo-inspired features |
-| 5 | SessionRegistry/EventRouter refactor | Dashboard feature claims |
-| 6 | Multi-session dashboard + approval inbox | Worktree mutations |
-| 7 | Workspace registry + safe worktree operations | Persistent terminal |
-| 8 | Connection supervisor/persistence | Rich Git review |
-| 9 | PTY/tmux terminal | Generic command API |
-| 10 | Rich Git review | Unrelated provider integrations |
+| Step | Scope | State | Must not include |
+| --- | --- | --- | --- |
+| 1 | Baseline/roadmap documentation | Committed as `0d75b07` | Feature or dependency changes |
+| 2 | AGP 8.13.2 + Gradle 8.13 | Committed as `fc025c7` | SDK and Kotlin changes |
+| 3 | `compileSdk = 36` | Committed as `a506f64` | `targetSdk` change |
+| 4 | `targetSdk = 36` | Committed as `acd38eb` | Paseo-inspired features |
+| 5 | SessionRegistry/EventRouter + regression fixes | Committed as `d9cd9f1` | Full dashboard claims |
+| 6 | Complete multi-session dashboard + grouped approval inbox | Partial Phase 2a only | Worktree mutations |
+| 7 | Workspace registry + safe worktree operations | Pending | Persistent terminal |
+| 8 | Connection supervisor/persistence | Pending | Rich Git review |
+| 9 | PTY/tmux terminal | Pending | Generic command API |
+| 10 | Rich Git review | Pending | Unrelated provider integrations |
 
 Small follow-up PRs are preferable to combining these boundaries. Each PR must
 state the exact test/device evidence it adds.
@@ -591,7 +704,17 @@ state the exact test/device evidence it adds.
 Start investigation in these locations:
 
 - `app/src/main/java/com/codex/remote/AppViewModel.kt`
-  - connection bootstrap, selection, event observation, and present state hub;
+  - connection bootstrap, selection, exact async ownership, session projection,
+    and present orchestration hub;
+- `app/src/main/java/com/codex/remote/session/SessionState.kt`
+  - per-session remote/cache state and retained-state budgets;
+- `app/src/main/java/com/codex/remote/session/SessionRegistry.kt`
+  - immutable thread registry, selected-session projection source, global
+    approval order, central bounds, and protected LRU eviction;
+- `app/src/main/java/com/codex/remote/session/SessionEventRouter.kt`
+  - exact thread/turn event routing and fail-closed diagnostics;
+- `app/src/main/java/com/codex/remote/session/SessionRequestTracker.kt`
+  - connection/load/selection/turn-start continuation ownership;
 - `app/src/main/java/com/codex/remote/data/rpc/CodexRpcClient.kt`
   - app-server requests, notifications, pagination, and approval parsing;
 - `app/src/main/java/com/codex/remote/data/ssh/SshAppServerTransport.kt`
@@ -601,19 +724,21 @@ Start investigation in these locations:
 - `app/src/main/java/com/codex/remote/ui/screens/WorkspaceScreen.kt`
   - current main workspace/session surface;
 - `app/src/test/java/com/codex/remote/ComposerStateTest.kt`
-  - selected-thread streaming behavior that Phase 1 must replace;
+  - selected-session UI behavior after Phase 1 projection;
+- `app/src/test/java/com/codex/remote/session/`
+  - routing, bounds, eviction, approval ownership, and async-request regression
+    tests;
+- `app/src/test/java/com/codex/remote/ui/screens/ApprovalOwnerPresentationTest.kt`
+  - exact owner presentation and fail-closed background approval behavior;
 - `app/src/test/java/com/codex/remote/domain/ApprovalQueueTest.kt`
   - concurrent approval invariants; and
 - `docs/ARCHITECTURE.md` and `docs/FEATURE_PARITY.md`
   - update whenever a feature crosses from proposed to verified.
 
-The generated `graphify-out/GRAPH_REPORT.md` was built from commit `372581ad`
-and is stale relative to the baseline commit. The codebase-memory graph was
-current at handoff and identified `AppViewModel`, `CodexRpcClient`, event
-handling, approval handling, and SSH transport as the main architectural
-clusters. If code is changed, refresh the local graph as required by the
-repository instructions; do not treat the stale generated report as current
-evidence.
+`graphify-out/` is generated and remains outside the implementation/docs
+commit unless deliberately refreshed and reviewed. Refresh the graph only at
+the repository-mandated end of code changes; do not treat an older generated
+report as evidence for the current working tree.
 
 ## 13. Default answers to implementation decisions
 

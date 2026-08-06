@@ -6,6 +6,13 @@ Audit baseline:
 - Open-source Codex app-server schema from `codex-rs/app-server-protocol`.
 - Android remains an SSH client only; agent execution stays on the remote host.
 
+Verification labels in this file distinguish source/automated implementation
+from device/runtime proof. The Android 16 and multi-session changes described
+below have automated coverage, and final local ARM64 build counts/digests are
+recorded in `docs/verification/ANDROID_16_MIGRATION.md`. A signed release,
+upgrade install, Android instrumented runtime, physical devices, and real SSH
+smoke are still pending.
+
 ## Implemented remote workflow
 
 | Area | Android support |
@@ -20,13 +27,19 @@ Audit baseline:
 | Long conversations | Open at the latest message, load older turns incrementally while scrolling upward, preserve the visible anchor during prepend, and show a return-to-latest button away from the bottom. |
 | MCP | Show server/tool/resource status, start OAuth, observe completion, and reload remote MCP configuration. |
 | Authentication | Reuse remote auth and support the ChatGPT device-code flow. |
-| Approvals | Command, file-change, permission, and structured user-input requests. |
+| Session state | Keep independent bounded timeline, history, goal, settings, turn, approval, unread, and diagnostic state for known remote threads; route interleaved events by exact thread/turn identity. |
+| Session supervision (partial) | Show per-task running, approval, failed, and unread indicators in the existing project/task navigation. This is not yet a dedicated dashboard. |
+| Approvals | Command, file-change, permission, and structured user-input requests in one arrival-ordered surface. Show exact owner task/path/ID; background or unknown owners cannot be allowed until the exact task is opened, while deny remains available. This is not yet a grouped inbox. |
 | Diagnostics | Context and rate-limit status, app-server warnings, feedback upload, and SSH host-key pinning. |
+| Android build baseline | Source compiles/targets API 36 with AGP 8.13.2, Gradle 8.13, JDK 17 and `minSdk = 26`. CI assembles JVM tests/lint, debug APK, Android-test APK, and an unsigned minified release, then checks integrity, 16 KiB alignment, expected signatures, and hashes. |
 
 ## Remaining gaps
 
 ### High priority
 
+- Complete multi-session dashboard and grouped approval inbox: host/project/
+  workspace grouping, aggregate status, safe bulk denial, notification deep
+  links, process-recreation restoration, and real three-session runtime proof.
 - Rich Git review: automatic base-branch discovery, per-file navigation, syntax-highlighted diffs, inline comments, commit/revert actions, and detached review delivery.
 - Edit or undo a historical turn. The protocol's `thread/rollback` is deprecated and does not restore repository changes; a correct implementation must restore both conversation history and affected files.
 - Background terminal sessions and interactive terminal input. Command events render, but Android has no terminal panel for long-running PTY sessions.
@@ -50,6 +63,17 @@ Audit baseline:
 
 - OpenSSH config expansion, ProxyJump, SSH agent or hardware-key authentication, and managed relay pairing.
 - Remote file open-in-editor actions, deep links, desktop notifications, and Android share-sheet integration.
+
+### Release and runtime verification
+
+- Production-signed minified release and signer-certificate match to `0.1.6`.
+- Upgrade installation over `0.1.6` with saved connections preserved.
+- Android 14, 15, and 16 device behavior, including Samsung background policy,
+  edge-to-edge, predictive Back, rotation, resizing, and keyboard insets.
+- Execution of the Android instrumentation test APK on a device/emulator. The
+  current CI compiles the APK but does not run it.
+- Real password/private-key SSH, host-key change rejection, streaming,
+  approval, reconnect, and remote Codex compatibility smoke.
 
 These gaps should not be represented as working until their app-server request,
 notification handling, UI state, error state, and non-destructive verification

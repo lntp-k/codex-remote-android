@@ -14,14 +14,56 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      - uses: android-actions/setup-android@v4
-      - name: Verify
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "platforms;android-36" "build-tools;35.0.0"
+      - name: Verify Gradle wrapper checksums
+        run: |
+          test "$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d ' ' -f 1)" = \
+            "81a82aaea5abcc8ff68b3dfcb58b3c3c429378efd98e7433460610fecd7ae45f"
+          grep -Fqx \
+            "distributionSha256Sum=20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78" \
+            gradle/wrapper/gradle-wrapper.properties
+      - name: Verify debug and unsigned release builds
+        env:
+          CODEX_REMOTE_KEYSTORE_PATH: ""
+          CODEX_REMOTE_KEYSTORE_PASSWORD: ""
+          CODEX_REMOTE_KEY_ALIAS: ""
+          CODEX_REMOTE_KEY_PASSWORD: ""
         run: |
           chmod +x gradlew
-          ./gradlew testDebugUnitTest lintDebug assembleDebug
+          ./gradlew --no-daemon --console=plain --warning-mode=all \
+            clean \
+            testDebugUnitTest \
+            lintDebug \
+            assembleDebug \
+            assembleDebugAndroidTest \
+            assembleRelease
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          test -s app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          test -s app/build/outputs/apk/release/app-release-unsigned.apk
+          test -s app/build/outputs/mapping/release/mapping.txt
+          test ! -e app/build/outputs/apk/release/app-release.apk
+          unzip -tqq app/build/outputs/apk/debug/app-debug.apk
+          unzip -tqq app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          unzip -tqq app/build/outputs/apk/release/app-release-unsigned.apk
+          zipalign -c -P 16 -v 4 app/build/outputs/apk/debug/app-debug.apk
+          zipalign -c -P 16 -v 4 app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          zipalign -c -P 16 -v 4 app/build/outputs/apk/release/app-release-unsigned.apk
+          apksigner verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          apksigner verify --verbose app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          if apksigner verify app/build/outputs/apk/release/app-release-unsigned.apk >/dev/null 2>&1; then
+            echo "Expected the CI release artifact to remain unsigned" >&2
+            exit 1
+          fi
+          sha256sum \
+            app/build/outputs/apk/debug/app-debug.apk \
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+            app/build/outputs/apk/release/app-release-unsigned.apk \
+            app/build/outputs/mapping/release/mapping.txt
