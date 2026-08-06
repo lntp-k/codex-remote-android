@@ -31,8 +31,6 @@ android {
         targetSdk = 35
         versionCode = 7
         versionName = "0.1.6"
-        resourceConfigurations += listOf("en", "ko")
-
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }
@@ -73,6 +71,10 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    androidResources {
+        localeFilters += listOf("en", "ko")
     }
 
     testOptions {
