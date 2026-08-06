@@ -23,7 +23,7 @@ require(releaseSigningValues.none { !it.isNullOrBlank() } || hasReleaseSigning) 
 
 android {
     namespace = "com.codex.remote"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.codex.remote"
