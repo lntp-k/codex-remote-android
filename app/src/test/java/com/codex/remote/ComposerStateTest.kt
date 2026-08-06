@@ -94,15 +94,6 @@ class ComposerStateTest {
     }
 
     @Test
-    fun streamedEventsOnlyApplyToTheSelectedThread() {
-        val state = AppUiState(selectedThreadId = "thread-a")
-
-        assertTrue(state.acceptsThreadEvent("thread-a"))
-        assertFalse(state.acceptsThreadEvent("thread-b"))
-        assertFalse(state.acceptsThreadEvent(null))
-    }
-
-    @Test
     fun completingATurnClosesEveryRunningIntermediateItem() {
         val timeline = listOf(
             TimelineItem("reasoning", TimelineKind.REASONING, status = "inProgress"),

@@ -29,6 +29,7 @@ import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.codex.remote.data.rpc.AppServerEvent
 import com.codex.remote.data.rpc.CodexRpcClient
 import com.codex.remote.data.store.ConnectionStore
 import com.codex.remote.domain.AppUiState
@@ -61,6 +62,10 @@ import com.codex.remote.domain.ThreadGoal
 import com.codex.remote.domain.ThreadGoalStatus
 import com.codex.remote.domain.TimelineItem
 import com.codex.remote.domain.TimelineKind
+import com.codex.remote.session.SessionDiagnosticCode
+import com.codex.remote.session.SessionEventRouter
+import com.codex.remote.session.SessionRegistry
+import com.codex.remote.session.SessionRouteDisposition
 import com.codex.remote.ui.screens.WorkspaceScreen
 import com.codex.remote.ui.theme.CodexRemoteTheme
 import kotlinx.coroutines.flow.first
@@ -306,11 +311,56 @@ val answer = 42
         composeRule.onAllNodesWithTag(CONVERSATION_BOTTOM_BUTTON).assertCountEquals(0)
         composeRule.onAllNodesWithTag(COMPOSER_GOAL_MARKER).assertCountEquals(0)
         assertFalse(composerText().contains("draft-a"))
-        composeRule.runOnIdle {
-            assertTrue(state.value.acceptsThreadEvent("thread-b"))
-            assertFalse(state.value.acceptsThreadEvent("thread-a"))
-            assertFalse(state.value.acceptsThreadEvent(null))
-        }
+    }
+
+    @Test
+    fun sessionRouterRejectsMissingAndUnknownThreadsAndRoutesOnlyTheExactKnownThread() {
+        val threadA = thread("thread-a", "Thread A")
+        val threadB = thread("thread-b", "Thread B")
+        var registry = SessionRegistry()
+        registry = registry.registerThread(threadA).registry
+        registry = registry.registerThread(threadB).registry
+        registry = registry.selectThread(threadB).registry
+        val knownThreadIds = setOf(threadA.id, threadB.id)
+        val originalSessions = registry.sessions
+
+        val missing = SessionEventRouter.route(
+            registry,
+            AppServerEvent.TurnRunning(threadId = null, running = true, turnId = "turn-missing"),
+            knownThreadIds,
+        )
+        assertTrue(missing.disposition is SessionRouteDisposition.Rejected)
+        assertEquals(
+            SessionDiagnosticCode.MISSING_THREAD_ID,
+            (missing.disposition as SessionRouteDisposition.Rejected).rejection.diagnostic.code,
+        )
+        assertEquals(originalSessions, missing.registry.sessions)
+        assertEquals(threadB.id, missing.registry.selectedThreadId)
+
+        val unknown = SessionEventRouter.route(
+            missing.registry,
+            AppServerEvent.TurnRunning("thread-unknown", running = true, turnId = "turn-unknown"),
+            knownThreadIds,
+        )
+        assertTrue(unknown.disposition is SessionRouteDisposition.Rejected)
+        assertEquals(
+            SessionDiagnosticCode.UNKNOWN_THREAD_ID,
+            (unknown.disposition as SessionRouteDisposition.Rejected).rejection.diagnostic.code,
+        )
+        assertEquals(missing.registry.sessions, unknown.registry.sessions)
+        assertFalse("thread-unknown" in unknown.registry.sessions)
+        assertEquals(threadB.id, unknown.registry.selectedThreadId)
+
+        val known = SessionEventRouter.route(
+            unknown.registry,
+            AppServerEvent.TurnRunning(threadB.id, running = true, turnId = "turn-b"),
+            knownThreadIds,
+        )
+        assertEquals(SessionRouteDisposition.Applied(threadB.id), known.disposition)
+        assertTrue(known.registry.sessions.getValue(threadB.id).isTurnRunning)
+        assertEquals("turn-b", known.registry.sessions.getValue(threadB.id).activeTurnId)
+        assertFalse(known.registry.sessions.getValue(threadA.id).isTurnRunning)
+        assertEquals(threadB.id, known.registry.selectedThreadId)
     }
 
     @Test
@@ -478,6 +528,7 @@ val answer = 42
                 ApprovalContextField("Working directory", "/workspace/secure-command"),
                 ApprovalContextField("Additional permissions", "{\"network\":{\"enabled\":true}}"),
             ),
+            threadId = "thread-a",
             availableDecisions = listOf("accept", "decline"),
         )
         val second = first.copy(
@@ -501,6 +552,41 @@ val answer = 42
             assertEquals(visibleKey, callbacks.approval?.first)
             assertEquals(RpcRequestId.Text("request-visible"), callbacks.approval?.first?.requestId)
             assertEquals("accept", callbacks.approval?.second)
+        }
+    }
+
+    @Test
+    fun backgroundApprovalShowsItsExactOwnerAndCannotBeAllowedFromTheSelectedThread() {
+        val selectedThread = thread("thread-a", "Selected task")
+        val backgroundThread = thread("thread-b", "Background review")
+        val request = ApprovalRequest(
+            requestId = RpcRequestId.Text("request-background"),
+            kind = ApprovalKind.COMMAND,
+            title = "Allow background command?",
+            detail = "git status --short",
+            rawMethod = "item/commandExecution/requestApproval",
+            threadId = backgroundThread.id,
+            availableDecisions = listOf("accept", "decline"),
+        )
+        val state = mutableStateOf(
+            baseState(threads = listOf(selectedThread, backgroundThread)).copy(
+                selectedThreadId = selectedThread.id,
+                approvalQueue = ApprovalQueue().enqueue(request),
+            ),
+        )
+        val callbacks = WorkspaceCallbacks()
+        show(state, callbacks)
+
+        composeRule.onNodeWithText("Approval for another task").assertIsDisplayed()
+        composeRule.onNodeWithText("Background review").assertIsDisplayed()
+        composeRule.onNodeWithText("Task ID: thread-b").assertIsDisplayed()
+        composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
+        composeRule.onNodeWithText("Deny").assertIsEnabled()
+        composeRule.onNodeWithText("Open owning task").assertIsDisplayed().performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(backgroundThread, callbacks.selectedThread)
+            assertEquals(null, callbacks.approval)
         }
     }
 
@@ -767,7 +853,7 @@ val answer = 42
                     onOpenConnections = {},
                     onNewThread = {},
                     onSelectProject = {},
-                    onSelectThread = {},
+                    onSelectThread = { callbacks.selectedThread = it },
                     onLoadOlderHistory = callbacks.onLoadOlder,
                     onRenameThread = { _, _ -> },
                     onArchiveThread = {},
@@ -883,6 +969,7 @@ class RemoteStateDeviceTest {
 private class WorkspaceCallbacks {
     var collaborationMode: String? = null
     var permissionMode: PermissionMode? = null
+    var selectedThread: RemoteThread? = null
     val sentMessages = mutableListOf<Pair<String, Boolean>>()
     var olderLoads: Int = 0
     var disconnects: Int = 0

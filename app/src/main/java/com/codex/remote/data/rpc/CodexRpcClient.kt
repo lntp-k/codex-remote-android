@@ -74,11 +74,37 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 sealed interface AppServerEvent {
+    enum class FailureTurnIdStatus {
+        EXACT,
+        LEGACY_ABSENT,
+        INVALID,
+    }
+
     data class ItemUpsert(val threadId: String?, val item: TimelineItem) : AppServerEvent
-    data class AgentDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
-    data class PlanDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
-    data class ReasoningDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
-    data class OutputDelta(val threadId: String?, val itemId: String, val delta: String) : AppServerEvent
+    data class AgentDelta(
+        val threadId: String?,
+        val turnId: String?,
+        val itemId: String,
+        val delta: String,
+    ) : AppServerEvent
+    data class PlanDelta(
+        val threadId: String?,
+        val turnId: String?,
+        val itemId: String,
+        val delta: String,
+    ) : AppServerEvent
+    data class ReasoningDelta(
+        val threadId: String?,
+        val turnId: String?,
+        val itemId: String,
+        val delta: String,
+    ) : AppServerEvent
+    data class OutputDelta(
+        val threadId: String?,
+        val turnId: String?,
+        val itemId: String,
+        val delta: String,
+    ) : AppServerEvent
     data class TurnRunning(
         val threadId: String?,
         val running: Boolean,
@@ -87,6 +113,10 @@ sealed interface AppServerEvent {
     data class Approval(val threadId: String?, val request: ApprovalRequest) : AppServerEvent
     data class ApprovalResolved(val threadId: String, val requestId: RpcRequestId) : AppServerEvent
     data object AccountChanged : AppServerEvent
+    data class ThreadStarted(
+        val threadId: String,
+        val thread: RemoteThread?,
+    ) : AppServerEvent
     data object ThreadsChanged : AppServerEvent
     data object SkillsChanged : AppServerEvent
     data class GoalUpdated(val threadId: String, val goal: ThreadGoal) : AppServerEvent
@@ -100,7 +130,16 @@ sealed interface AppServerEvent {
         val settings: RemoteThreadSettingsSnapshot,
     ) : AppServerEvent
     data class LoginCompleted(val success: Boolean, val error: String?) : AppServerEvent
-    data class Failure(val message: String, val threadId: String? = null) : AppServerEvent
+    data class Failure(
+        val message: String,
+        val threadId: String? = null,
+        val turnId: String? = null,
+        val turnIdStatus: FailureTurnIdStatus = if (turnId.isNullOrBlank()) {
+            FailureTurnIdStatus.INVALID
+        } else {
+            FailureTurnIdStatus.EXACT
+        },
+    ) : AppServerEvent
     data class FatalProtocolError(val message: String) : AppServerEvent
     data class Warning(val message: String) : AppServerEvent
     data class Diagnostic(val message: String) : AppServerEvent
@@ -279,7 +318,7 @@ internal fun trackedServerRequestResolvedEvent(
     requests: OutstandingApprovalRequests,
     params: JsonObject,
 ): AppServerEvent {
-    val threadId = params.strictString("threadId")?.takeIf(String::isNotBlank)
+    val threadId = params.strictNonBlankString("threadId")
     val requestId = params["requestId"]?.let(CodexRpcClient::parseRequestId)
     if (threadId == null || requestId == null || !requests.resolve(requestId, threadId)) {
         requests.invalidate()
@@ -416,7 +455,8 @@ class CodexRpcClient(
     suspend fun startDeviceLogin(): RemoteDeviceLogin {
         val result = request("account/login/start", buildJsonObject { put("type", "chatgptDeviceCode") })
         return RemoteDeviceLogin(
-            loginId = result.string("loginId") ?: throw RpcException("Remote did not return a login ID"),
+            loginId = result.strictNonBlankString("loginId")
+                ?: throw RpcException("Remote did not return a login ID"),
             verificationUrl = result.string("verificationUrl")
                 ?: throw RpcException("Remote did not return a device sign-in URL"),
             userCode = result.string("userCode") ?: throw RpcException("Remote did not return a device code"),
@@ -520,7 +560,8 @@ class CodexRpcClient(
                 collaborationMode = result.obj("collaborationMode")?.string("mode"),
                 approvalPolicy = result.string("approvalPolicy") ?: approvalPolicy,
                 approvalsReviewer = result.string("approvalsReviewer") ?: approvalsReviewer,
-                permissionProfile = result.obj("activePermissionProfile")?.string("id") ?: permissionProfile,
+                permissionProfile = result.obj("activePermissionProfile")?.strictNonBlankString("id")
+                    ?: permissionProfile,
             ),
         )
     }
@@ -532,8 +573,9 @@ class CodexRpcClient(
     ): StartedRemoteReview {
         val result = request("review/start", reviewStartParams(threadId, targetKind, targetValue))
         return StartedRemoteReview(
-            turnId = result.obj("turn")?.string("id") ?: throw RpcException("review/start did not return turn.id"),
-            threadId = result.string("reviewThreadId") ?: threadId,
+            turnId = result.obj("turn")?.strictNonBlankString("id")
+                ?: throw RpcException("review/start did not return turn.id"),
+            threadId = result.strictNonBlankString("reviewThreadId") ?: threadId,
         )
     }
 
@@ -572,7 +614,7 @@ class CodexRpcClient(
 
     suspend fun submitFeedback(classification: String, reason: String, threadId: String?): String {
         val result = request("feedback/upload", feedbackUploadParams(classification, reason, threadId))
-        return result.string("threadId").orEmpty()
+        return result.strictNonBlankString("threadId").orEmpty()
     }
 
     suspend fun readRateLimits(): RemoteRateLimits {
@@ -608,7 +650,8 @@ class CodexRpcClient(
             threadStartParams(cwd, model, serviceTier, approvalPolicy, approvalsReviewer, permissionProfile),
         )
         return StartedRemoteThread(
-            id = result.obj("thread")?.string("id") ?: throw RpcException("thread/start did not return thread.id"),
+            id = result.obj("thread")?.strictNonBlankString("id")
+                ?: throw RpcException("thread/start did not return thread.id"),
             model = result.string("model") ?: model,
             reasoningEffort = result.string("reasoningEffort"),
             serviceTier = result.string("serviceTier") ?: serviceTier,
@@ -628,11 +671,13 @@ class CodexRpcClient(
         val thread = result.obj("thread")
         val initialPage = result.obj("initialTurnsPage")
         if (initialPage != null) {
+            val turns = initialPage.array("data")
             return sessionFromResume(
                 result = result,
                 thread = thread,
                 fallbackCwd = cwd,
-                timeline = parseTurnsTimeline(initialPage.array("data")),
+                turns = turns,
+                timeline = parseTurnsTimeline(turns),
                 olderHistoryCursor = selectOlderHistoryCursor(
                     initialPageCursor = initialPage.string("nextCursor"),
                     turnsBackwardsCursor = result.string("turnsBackwardsCursor"),
@@ -651,22 +696,26 @@ class CodexRpcClient(
                 put("includeTurns", true)
             }).obj("thread") ?: thread
         }
+        val legacyTurns = legacyThread?.array("turns").orEmpty()
         return sessionFromResume(
             result = result,
             thread = legacyThread,
             fallbackCwd = cwd,
-            timeline = parseTurnsTimeline(legacyThread?.array("turns").orEmpty(), descending = false),
+            turns = legacyTurns,
+            timeline = parseTurnsTimeline(legacyTurns, descending = false),
         )
     }
 
     private suspend fun resumeThreadLegacy(threadId: String, cwd: String): RemoteThreadSession {
         val result = request("thread/resume", threadResumeParams(threadId, cwd, paginated = false))
         val thread = result.obj("thread")
+        val turns = thread?.array("turns").orEmpty()
         return sessionFromResume(
             result = result,
             thread = thread,
             fallbackCwd = cwd,
-            timeline = parseTurnsTimeline(thread?.array("turns").orEmpty(), descending = false),
+            turns = turns,
+            timeline = parseTurnsTimeline(turns, descending = false),
         )
     }
 
@@ -674,6 +723,7 @@ class CodexRpcClient(
         result: JsonObject,
         thread: JsonObject?,
         fallbackCwd: String,
+        turns: List<JsonElement>,
         timeline: List<TimelineItem>,
         olderHistoryCursor: String? = null,
     ) = RemoteThreadSession(
@@ -686,7 +736,8 @@ class CodexRpcClient(
         collaborationMode = result.obj("collaborationMode")?.string("mode"),
         approvalPolicy = result.string("approvalPolicy"),
         approvalsReviewer = result.string("approvalsReviewer"),
-        permissionProfile = result.obj("activePermissionProfile")?.string("id"),
+        permissionProfile = result.obj("activePermissionProfile")?.strictNonBlankString("id"),
+        activeTurnId = parseActiveTurnId(turns),
     )
 
     suspend fun loadOlderThreadHistory(threadId: String, cursor: String): RemoteThreadHistoryPage {
@@ -713,8 +764,8 @@ class CodexRpcClient(
         collaborationMode: RemoteCollaborationMode?,
         mentions: List<ComposerMention> = emptyList(),
         attachments: List<ComposerImageAttachment> = emptyList(),
-    ) {
-        request(
+    ): String? {
+        val result = request(
             "turn/start",
             turnStartParams(
                 threadId,
@@ -731,6 +782,7 @@ class CodexRpcClient(
                 attachments,
             ),
         )
+        return startedTurnId(result)
     }
 
     suspend fun steerTurn(
@@ -911,8 +963,8 @@ class CodexRpcClient(
     private suspend fun handleNotification(method: String, params: JsonObject) {
         when (method) {
             "item/started", "item/completed" -> params.obj("item")?.let(::parseTimelineItem)?.let { item ->
-                val threadId = params.strictString("threadId")?.takeIf(String::isNotBlank) ?: return@let
-                val turnId = params.strictString("turnId")?.takeIf(String::isNotBlank) ?: return@let
+                val threadId = params.strictNonBlankString("threadId") ?: return@let
+                val turnId = params.strictNonBlankString("turnId") ?: return@let
                 val status = if (method == "item/started") {
                     "inProgress"
                 } else {
@@ -933,63 +985,62 @@ class CodexRpcClient(
             }
             "item/agentMessage/delta" -> _events.emit(
                 AppServerEvent.AgentDelta(
-                    params.string("threadId"),
-                    params.string("itemId").orEmpty(),
-                    params.string("delta").orEmpty(),
+                    params.strictNonBlankString("threadId"),
+                    params.strictNonBlankString("turnId"),
+                    params.strictString("itemId").orEmpty(),
+                    params.strictString("delta").orEmpty(),
                 ),
             )
             "item/plan/delta" -> _events.emit(
                 AppServerEvent.PlanDelta(
-                    params.string("threadId"),
-                    params.string("itemId").orEmpty(),
-                    params.string("delta").orEmpty(),
+                    params.strictNonBlankString("threadId"),
+                    params.strictNonBlankString("turnId"),
+                    params.strictString("itemId").orEmpty(),
+                    params.strictString("delta").orEmpty(),
                 ),
             )
             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta" -> _events.emit(
                 AppServerEvent.ReasoningDelta(
-                    params.string("threadId"),
-                    params.string("itemId").orEmpty(),
-                    params.string("delta").orEmpty(),
+                    params.strictNonBlankString("threadId"),
+                    params.strictNonBlankString("turnId"),
+                    params.strictString("itemId").orEmpty(),
+                    params.strictString("delta").orEmpty(),
                 ),
             )
             "item/commandExecution/outputDelta" -> _events.emit(
                 AppServerEvent.OutputDelta(
-                    params.string("threadId"),
-                    params.string("itemId").orEmpty(),
-                    params.string("delta").orEmpty(),
+                    params.strictNonBlankString("threadId"),
+                    params.strictNonBlankString("turnId"),
+                    params.strictString("itemId").orEmpty(),
+                    params.strictString("delta").orEmpty(),
                 ),
             )
             "turn/diff/updated" -> Unit
-            "turn/started" -> _events.emit(
-                AppServerEvent.TurnRunning(
-                    threadId = params.string("threadId"),
-                    running = true,
-                    turnId = params.obj("turn")?.string("id"),
-                ),
-            )
+            "turn/started" -> _events.emit(turnRunningEvent(params, running = true))
             "turn/completed" -> {
-                val turn = params.obj("turn")
-                val turnError = turn?.obj("error")?.string("message")
-                val threadId = params.string("threadId")
-                if (!turnError.isNullOrBlank()) _events.emit(AppServerEvent.Failure(turnError, threadId))
-                _events.emit(AppServerEvent.TurnRunning(threadId, false, turn?.string("id")))
+                val event = turnRunningEvent(params, running = false)
+                turnCompletedFailureEvent(params)?.let { _events.emit(it) }
+                _events.emit(event)
             }
             "account/updated" -> _events.emit(AppServerEvent.AccountChanged)
-            "thread/started", "thread/status/changed", "thread/archived", "thread/deleted", "thread/closed",
+            "thread/started" -> _events.emit(threadStartedEvent(params))
+            "thread/status/changed", "thread/archived", "thread/deleted", "thread/closed",
             "thread/name/updated", "thread/unarchived" ->
                 _events.emit(AppServerEvent.ThreadsChanged)
             "skills/changed" -> _events.emit(AppServerEvent.SkillsChanged)
             "thread/goal/updated" -> {
                 val goal = params["goal"]?.let(::parseThreadGoal) ?: return
-                val threadId = params.string("threadId") ?: goal.threadId
+                val parameterThreadId = params.strictNonBlankString("threadId")
+                if (parameterThreadId != null && parameterThreadId != goal.threadId) return
+                val threadId = parameterThreadId ?: goal.threadId
                 _events.emit(AppServerEvent.GoalUpdated(threadId, goal))
             }
-            "thread/goal/cleared" -> params.string("threadId")?.let { threadId ->
+            "thread/goal/cleared" -> params.strictNonBlankString("threadId")?.let { threadId ->
                 _events.emit(AppServerEvent.GoalCleared(threadId))
             }
             "thread/tokenUsage/updated" -> {
                 val usage = params["tokenUsage"]?.let(::parseThreadTokenUsage) ?: return
-                params.string("threadId")?.let { threadId ->
+                params.strictNonBlankString("threadId")?.let { threadId ->
                     _events.emit(AppServerEvent.TokenUsageUpdated(threadId, usage))
                 }
             }
@@ -998,7 +1049,7 @@ class CodexRpcClient(
                     _events.emit(AppServerEvent.RateLimitsUpdated(rateLimits))
                 }
             }
-            "thread/compacted" -> params.string("threadId")?.let { threadId ->
+            "thread/compacted" -> params.strictNonBlankString("threadId")?.let { threadId ->
                 _events.emit(AppServerEvent.ContextCompacted(threadId))
             }
             "mcpServer/oauthLogin/completed" -> _events.emit(
@@ -1009,7 +1060,7 @@ class CodexRpcClient(
                 ),
             )
             "thread/settings/updated" -> {
-                val threadId = params.string("threadId") ?: return
+                val threadId = params.strictNonBlankString("threadId") ?: return
                 val settings = params.obj("threadSettings") ?: return
                 _events.emit(
                     AppServerEvent.ThreadSettingsUpdated(
@@ -1019,7 +1070,8 @@ class CodexRpcClient(
                             reasoningEffort = settings.string("effort"),
                             serviceTier = settings.string("serviceTier"),
                             collaborationMode = settings.obj("collaborationMode")?.string("mode"),
-                            permissionProfile = settings.obj("activePermissionProfile")?.string("id"),
+                            permissionProfile = settings.obj("activePermissionProfile")
+                                ?.strictNonBlankString("id"),
                             approvalPolicy = settings.string("approvalPolicy"),
                             approvalsReviewer = settings.string("approvalsReviewer"),
                         ),
@@ -1033,13 +1085,7 @@ class CodexRpcClient(
                 ),
             )
             "error" -> {
-                val error = params.obj("error")
-                _events.emit(
-                    AppServerEvent.Failure(
-                        error?.string("message") ?: "Codex turn failed",
-                        params.string("threadId"),
-                    ),
-                )
+                _events.emit(genericFailureEvent(params))
             }
             "warning", "guardianWarning", "deprecationNotice", "configWarning" -> {
                 val message = params.string("message") ?: params.obj("warning")?.string("message")
@@ -1069,6 +1115,66 @@ class CodexRpcClient(
     }
 
     companion object {
+        internal fun turnRunningEvent(params: JsonObject, running: Boolean) =
+            AppServerEvent.TurnRunning(
+                threadId = params.strictNonBlankString("threadId"),
+                running = running,
+                turnId = params.obj("turn")?.strictNonBlankString("id"),
+            )
+
+        internal fun turnCompletedFailureEvent(params: JsonObject): AppServerEvent.Failure? {
+            val message = params.obj("turn")?.obj("error")?.string("message")
+                ?.takeIf(String::isNotBlank)
+                ?: return null
+            val lifecycle = turnRunningEvent(params, running = false)
+            return AppServerEvent.Failure(
+                message = message,
+                threadId = lifecycle.threadId,
+                turnId = lifecycle.turnId,
+                turnIdStatus = if (lifecycle.turnId == null) {
+                    AppServerEvent.FailureTurnIdStatus.INVALID
+                } else {
+                    AppServerEvent.FailureTurnIdStatus.EXACT
+                },
+            )
+        }
+
+        internal fun genericFailureEvent(params: JsonObject): AppServerEvent.Failure {
+            val turnId = params.strictNonBlankString("turnId")
+            val turnIdStatus = when {
+                turnId != null -> AppServerEvent.FailureTurnIdStatus.EXACT
+                "turnId" !in params -> AppServerEvent.FailureTurnIdStatus.LEGACY_ABSENT
+                else -> AppServerEvent.FailureTurnIdStatus.INVALID
+            }
+            return AppServerEvent.Failure(
+                message = params.obj("error")?.string("message") ?: "Codex turn failed",
+                threadId = params.strictNonBlankString("threadId"),
+                turnId = turnId,
+                turnIdStatus = turnIdStatus,
+            )
+        }
+
+        internal fun threadStartedEvent(params: JsonObject): AppServerEvent {
+            val threadObject = params.obj("thread")
+            val nestedThreadId = threadObject?.strictNonBlankString("id")
+            val parameterThreadId = params.strictNonBlankString("threadId")
+
+            if (nestedThreadId != null && parameterThreadId != null && nestedThreadId != parameterThreadId) {
+                return AppServerEvent.ThreadsChanged
+            }
+
+            val threadId = nestedThreadId ?: parameterThreadId ?: return AppServerEvent.ThreadsChanged
+            val thread = threadObject
+                ?.takeIf { nestedThreadId == threadId }
+                ?.let(::parseThread)
+                ?.takeIf { it.id == threadId }
+            return AppServerEvent.ThreadStarted(threadId, thread)
+        }
+
+        internal fun startedTurnId(result: JsonObject): String? =
+            result.obj("turn")?.strictNonBlankString("id")
+                ?: result.strictNonBlankString("turnId")
+
         internal fun parseRequestId(element: JsonElement): RpcRequestId? {
             val primitive = element as? JsonPrimitive ?: return null
             return if (primitive.isString) {
@@ -1108,7 +1214,8 @@ class CodexRpcClient(
                 detail = method,
                 rawMethod = method,
                 rawParams = rawParams,
-                threadId = params.string("threadId") ?: params.string("conversationId"),
+                threadId = params.strictNonBlankString("threadId")
+                    ?: params.strictNonBlankString("conversationId"),
                 context = listOf(ApprovalContextField("Unrecognized request", rawParams)),
                 availableDecisions = listOf("decline"),
                 securityContextComplete = false,
@@ -1194,11 +1301,23 @@ class CodexRpcClient(
         ): List<TimelineItem> = (if (descending) turns.asReversed() else turns)
             .flatMap { turnElement ->
                 val turn = turnElement.asObject() ?: return@flatMap emptyList()
-                val turnId = turn.strictString("id")
+                val turnId = turn.strictNonBlankString("id")
                 turn.array("items").mapNotNull { itemElement ->
                     parseTimelineItem(itemElement)?.copy(turnId = turnId)
                 }
             }
+
+        internal fun parseActiveTurnId(turns: List<JsonElement>): String? {
+            val activeTurnIds = mutableListOf<String>()
+            turns.forEach { turnElement ->
+                val turn = turnElement.asObject() ?: return@forEach
+                val status = turn.strictString("status") ?: return@forEach
+                if (status !in ACTIVE_TURN_STATUSES) return@forEach
+                val turnId = turn.strictNonBlankString("id") ?: return null
+                activeTurnIds += turnId
+            }
+            return activeTurnIds.singleOrNull()
+        }
 
         internal fun checkedNextHistoryCursor(
             returnedCursor: String?,
@@ -1477,7 +1596,7 @@ class CodexRpcClient(
 
         internal fun parsePermissionProfile(element: JsonElement): RemotePermissionProfile? {
             val profile = element.asObject() ?: return null
-            val id = profile.string("id") ?: return null
+            val id = profile.strictNonBlankString("id") ?: return null
             return RemotePermissionProfile(
                 id = id,
                 description = profile.string("description").orEmpty(),
@@ -1497,7 +1616,7 @@ class CodexRpcClient(
 
         internal fun parseThreadGoal(element: JsonElement): ThreadGoal? {
             val goal = element.asObject() ?: return null
-            val threadId = goal.string("threadId") ?: return null
+            val threadId = goal.strictNonBlankString("threadId") ?: return null
             val objective = goal.string("objective") ?: return null
             val status = goal.string("status")?.toThreadGoalStatus() ?: return null
             return ThreadGoal(
@@ -1691,20 +1810,20 @@ class CodexRpcClient(
         }
 
         internal fun parseThread(element: JsonElement): RemoteThread? {
-        val item = element.asObject() ?: return null
-        val id = item.string("id") ?: return null
-        return RemoteThread(
-            id = id,
-            title = item.string("name") ?: item.string("preview")?.take(80).orEmpty().ifBlank { "New task" },
-            cwd = item.string("cwd").orEmpty(),
-            updatedAt = item["updatedAt"]?.jsonPrimitive?.longOrNull ?: 0,
-            isPinned = item.boolean("isPinned"),
-            status = when (val status = item["status"]) {
-                is JsonPrimitive -> status.contentOrNull.orEmpty()
-                is JsonObject -> status.string("type") ?: status.keys.firstOrNull().orEmpty()
-                else -> ""
-            },
-        )
+            val item = element.asObject() ?: return null
+            val id = item.strictNonBlankString("id") ?: return null
+            return RemoteThread(
+                id = id,
+                title = item.string("name") ?: item.string("preview")?.take(80).orEmpty().ifBlank { "New task" },
+                cwd = item.string("cwd").orEmpty(),
+                updatedAt = item["updatedAt"]?.jsonPrimitive?.longOrNull ?: 0,
+                isPinned = item.boolean("isPinned"),
+                status = when (val status = item["status"]) {
+                    is JsonPrimitive -> status.contentOrNull.orEmpty()
+                    is JsonObject -> status.string("type") ?: status.keys.firstOrNull().orEmpty()
+                    else -> ""
+                },
+            )
         }
     }
 
@@ -1802,8 +1921,8 @@ private fun parseCommandApprovalRequest(
     val legacy = method == "execCommandApproval"
     val allowedKeys = if (legacy) LEGACY_COMMAND_APPROVAL_KEYS else NEW_COMMAND_APPROVAL_KEYS
     val unknown = params.unknownFields(allowedKeys)
-    val threadId = params.strictString(if (legacy) "conversationId" else "threadId")
-    val turnId = params.strictString("turnId")
+    val threadId = params.strictNonBlankString(if (legacy) "conversationId" else "threadId")
+    val turnId = params.strictNonBlankString("turnId")
     val itemId = params.strictString(if (legacy) "callId" else "itemId")
     val cwd = params.strictString("cwd")
     val command = params["command"].approvalDisplayValue()
@@ -1875,8 +1994,8 @@ private fun parseFileApprovalRequest(
     val legacy = method == "applyPatchApproval"
     val allowedKeys = if (legacy) LEGACY_FILE_APPROVAL_KEYS else NEW_FILE_APPROVAL_KEYS
     val unknown = params.unknownFields(allowedKeys)
-    val threadId = params.strictString(if (legacy) "conversationId" else "threadId")
-    val turnId = params.strictString("turnId")
+    val threadId = params.strictNonBlankString(if (legacy) "conversationId" else "threadId")
+    val turnId = params.strictNonBlankString("turnId")
     val itemId = params.strictString(if (legacy) "callId" else "itemId")
     val (fileChanges, fileChangesValid) = if (legacy) params.parseLegacyFileChanges() else emptyList<FileChangeSummary>() to true
     val requiredContextPresent = if (legacy) {
@@ -1924,8 +2043,8 @@ private fun parsePermissionApprovalRequest(
     rawParams: String,
 ): ApprovalRequest {
     val unknown = params.unknownFields(PERMISSION_APPROVAL_KEYS)
-    val threadId = params.strictString("threadId")
-    val turnId = params.strictString("turnId")
+    val threadId = params.strictNonBlankString("threadId")
+    val turnId = params.strictNonBlankString("turnId")
     val itemId = params.strictString("itemId")
     val cwd = params.strictString("cwd")
     val permissions = params["permissions"]
@@ -1987,8 +2106,8 @@ private fun parseUserInputRequest(
         questions.size == boundedQuestionElements.size &&
         questions.map(ApprovalQuestion::id).distinct().size == questions.size &&
         isBlockingValid && autoResolutionValid && unknown == null &&
-        !params.strictString("threadId").isNullOrBlank() &&
-        !params.strictString("turnId").isNullOrBlank() && !params.strictString("itemId").isNullOrBlank()
+        params.strictNonBlankString("threadId") != null &&
+        params.strictNonBlankString("turnId") != null && !params.strictString("itemId").isNullOrBlank()
     return ApprovalRequest(
         requestId = id,
         kind = ApprovalKind.USER_INPUT,
@@ -1997,8 +2116,8 @@ private fun parseUserInputRequest(
         rawMethod = method,
         rawParams = rawParams,
         questions = questions,
-        threadId = params.strictString("threadId"),
-        turnId = params.strictString("turnId"),
+        threadId = params.strictNonBlankString("threadId"),
+        turnId = params.strictNonBlankString("turnId"),
         itemId = params.strictString("itemId"),
         availableDecisions = if (securityContextComplete) listOf("accept") else emptyList(),
         securityContextComplete = securityContextComplete,
@@ -2374,6 +2493,7 @@ private const val MODEL_PAGE_SIZE = 100
 private const val MCP_STATUS_PAGE_SIZE = 100
 private const val PERMISSION_PROFILE_PAGE_SIZE = 100
 internal const val THREAD_HISTORY_PAGE_SIZE = 5
+private val ACTIVE_TURN_STATUSES = setOf("inProgress", "running", "started")
 
 internal fun selectOlderHistoryCursor(
     initialPageCursor: String?,
@@ -2399,6 +2519,8 @@ private fun JsonObject.array(key: String): JsonArray = this[key] as? JsonArray ?
 private fun JsonObject.string(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 private fun JsonObject.strictString(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.contentOrNull
+private fun JsonObject.strictNonBlankString(key: String): String? =
+    strictString(key)?.takeIf(String::isNotBlank)
 private fun JsonObject.hasValidOptionalStrings(keys: Set<String>): Boolean = keys.all { key ->
     val value = this[key]
     value == null || value is JsonNull || value is JsonPrimitive && value.isString
