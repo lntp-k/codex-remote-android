@@ -1,6 +1,6 @@
 # Architecture
 
-## Current implementation boundary (2026-08-06)
+## Current implementation boundary (2026-08-08)
 
 The direct Android-to-SSH topology remains unchanged. The current branch adds
 the Paseo-inspired **multi-session state foundation**, not a relay, Android
@@ -22,7 +22,9 @@ Not yet established by this implementation:
 - a complete multi-session dashboard or grouped approval inbox;
 - Android process-recreation persistence or remote task persistence;
 - Workspace/worktree lifecycle, terminal sessions, or rich Git mutation UI;
-- signed-release/upgrade compatibility; or
+- actual device upgrade/data-preservation compatibility (the signed `0.1.7`
+  candidate has the same package and signer as `0.1.6` and a higher version
+  code, so the static upgrade prerequisites are established); or
 - physical-device, Android instrumentation runtime, and real SSH smoke proof.
 
 ## Source audit

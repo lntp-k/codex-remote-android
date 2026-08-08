@@ -227,3 +227,24 @@ Before release promotion:
 
 Only that later evidence may change this record from "targeted remediation" to
 "post-fix verified".
+
+## 2026-08-08 signed-artifact addendum
+
+This addendum records later artifact evidence without rewriting the historical
+state of the 2026-08-06 review or treating it as a fresh post-fix scan.
+
+- A minified `0.1.7` (`versionCode = 8`, target API 36) QA candidate was built
+  with the authorized local release certificate.
+- Its application ID is `com.codex.remote`, and its signer certificate SHA-256
+  exactly matches the retained signed `0.1.6` (`versionCode = 7`) APK:
+  `253257e7a3f4a1175b5eed656470e764efad2072252442cee617f99bb2bd1d20`.
+- APK Signature Scheme v2, ZIP integrity, all 8 native-library ZIP data
+  offsets, and all ELF `PT_LOAD` alignments passed the static checks.
+- The signed APK SHA-256 is
+  `fb18519c95a8d51bf4e845858f0cfacfc3c5f9474907ebd482332e0a17d2d440`.
+
+Closure item 5 is therefore complete only for artifact signing and signer
+continuity. Actual upgrade installation over `0.1.6`, saved-connection
+preservation, Android device execution, real SSH, and a fresh final-commit
+security scan remain open. See `ANDROID_16_MIGRATION.md` for the complete
+evidence and boundary.

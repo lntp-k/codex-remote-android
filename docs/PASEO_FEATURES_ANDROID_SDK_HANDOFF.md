@@ -6,7 +6,8 @@
 - Baseline commit: `c2b5e60fecc37bb8d95c52d082da06031f87187c`
 - Baseline release: `0.1.6` (`versionCode = 7`)
 - Implementation branch: `agent/paseo-android16-session-registry`
-- Current committed implementation tip: `d9cd9f1` (`Implement bounded multi-session routing`)
+- Current committed verification tip before `0.1.7` release metadata: `e794d9e`
+  (`Document and verify Android multi-session migration`)
 
 ## 0. 한국어 요약
 
@@ -27,9 +28,10 @@
 
 아직 완성되지 않은 다음 단계는 완전한 멀티 세션 대시보드/통합 승인함,
 명시적 Workspace·worktree, 지속 실행/복구, 터미널, 풍부한 Git 검토이다.
-서명된 릴리스, 기존 `0.1.6` 위 업그레이드, 실제 Android 기기, 실제 SSH,
-Android instrumentation 런타임 검증도 완료되지 않았다. 현재 자동 검증
-산출물과 최종 clean build 수치는
+서명된 `0.1.7` QA 후보와 기존 `0.1.6`의 서명자 일치는 확인했다. 다만
+실제 `0.1.6` 위 업그레이드와 연결정보 보존, 실제 Android 기기, 실제
+SSH, Android instrumentation 런타임 검증은 완료되지 않았다. 현재 자동
+검증 산출물과 최종 clean build 수치는
 `docs/verification/ANDROID_16_MIGRATION.md`에 기록한다.
 
 Android 17/API 37은 아직 운영 대상으로 삼지 않는다. 특히 사설 IP,
@@ -210,9 +212,9 @@ usable. Suggested release names are provisional.
 
 ### Phase 0A - Capture the baseline
 
-Status: **partially complete**. Source/build identity and automated gates are
-recorded. Physical-device, signed-release, upgrade-installation, and real SSH
-baseline evidence remain open.
+Status: **partially complete**. Source/build identity, automated gates, and the
+signed `0.1.7` candidate with signer continuity are recorded. Physical-device,
+upgrade-installation, and real SSH baseline evidence remain open.
 
 Purpose: make later regressions attributable.
 
@@ -234,8 +236,9 @@ Acceptance criteria:
 
 Status: **implemented** in commit `fc025c7`. The toolchain is AGP 8.13.2,
 Gradle 8.13, and JDK 17. Automated debug/unsigned-minified-release assembly is
-part of the current verification path. A signed production release and upgrade
-installation were not performed.
+part of the CI verification path. An authorized local release certificate was
+used for the signed `0.1.7` QA candidate, but upgrade installation was not
+performed and the artifact has not been promoted as device-validated.
 
 Files expected to change:
 
@@ -279,7 +282,8 @@ Acceptance criteria:
 ### Phase 0D - Target API 36
 
 Status: **implemented in source** in commit `acd38eb`; device behavior remains
-unverified. This must not be described as a device-validated `0.1.7` release.
+unverified. A signed `0.1.7` QA candidate now exists, but it must not be
+described as a device-validated release.
 
 Change `targetSdk` from 35 to 36 and explicitly validate Android 16 behavior:
 
@@ -290,8 +294,9 @@ Change `targetSdk` from 35 to 36 and explicitly validate Android 16 behavior:
 - fixed-rate scheduling behavior, if any scheduling is introduced; and
 - large-screen resizing and rotation.
 
-Deliverable: `0.1.7-beta1` followed by a signed `0.1.7` only after device
-validation.
+Deliverable: promote the existing signed `0.1.7` QA candidate only after the
+device, upgrade-preservation, and real-SSH gates pass; rebuild if any source or
+release metadata changes before promotion.
 
 ### Phase 1 - Per-session state and event routing
 
@@ -690,11 +695,12 @@ without recording its complete version and digest.
 | 3 | `compileSdk = 36` | Committed as `a506f64` | `targetSdk` change |
 | 4 | `targetSdk = 36` | Committed as `acd38eb` | Paseo-inspired features |
 | 5 | SessionRegistry/EventRouter + regression fixes | Committed as `d9cd9f1` | Full dashboard claims |
-| 6 | Complete multi-session dashboard + grouped approval inbox | Partial Phase 2a only | Worktree mutations |
-| 7 | Workspace registry + safe worktree operations | Pending | Persistent terminal |
-| 8 | Connection supervisor/persistence | Pending | Rich Git review |
-| 9 | PTY/tmux terminal | Pending | Generic command API |
-| 10 | Rich Git review | Pending | Unrelated provider integrations |
+| 6 | `0.1.7` release metadata + signed candidate evidence | Verified 2026-08-08; device promotion pending | Device-validation claims |
+| 7 | Complete multi-session dashboard + grouped approval inbox | Partial Phase 2a only | Worktree mutations |
+| 8 | Workspace registry + safe worktree operations | Pending | Persistent terminal |
+| 9 | Connection supervisor/persistence | Pending | Rich Git review |
+| 10 | PTY/tmux terminal | Pending | Generic command API |
+| 11 | Rich Git review | Pending | Unrelated provider integrations |
 
 Small follow-up PRs are preferable to combining these boundaries. Each PR must
 state the exact test/device evidence it adds.

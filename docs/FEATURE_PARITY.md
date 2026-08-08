@@ -9,8 +9,9 @@ Audit baseline:
 Verification labels in this file distinguish source/automated implementation
 from device/runtime proof. The Android 16 and multi-session changes described
 below have automated coverage, and final local ARM64 build counts/digests are
-recorded in `docs/verification/ANDROID_16_MIGRATION.md`. A signed release,
-upgrade install, Android instrumented runtime, physical devices, and real SSH
+recorded in `docs/verification/ANDROID_16_MIGRATION.md`. A signed `0.1.7` QA
+candidate and signer continuity with `0.1.6` are verified. Actual upgrade
+installation, Android instrumented runtime, physical devices, and real SSH
 smoke are still pending.
 
 ## Implemented remote workflow
@@ -31,7 +32,7 @@ smoke are still pending.
 | Session supervision (partial) | Show per-task running, approval, failed, and unread indicators in the existing project/task navigation. This is not yet a dedicated dashboard. |
 | Approvals | Command, file-change, permission, and structured user-input requests in one arrival-ordered surface. Show exact owner task/path/ID; background or unknown owners cannot be allowed until the exact task is opened, while deny remains available. This is not yet a grouped inbox. |
 | Diagnostics | Context and rate-limit status, app-server warnings, feedback upload, and SSH host-key pinning. |
-| Android build baseline | Source compiles/targets API 36 with AGP 8.13.2, Gradle 8.13, JDK 17 and `minSdk = 26`. CI assembles JVM tests/lint, debug APK, Android-test APK, and an unsigned minified release, then checks integrity, 16 KiB alignment, expected signatures, and hashes. |
+| Android build baseline | Source compiles/targets API 36 with AGP 8.13.2, Gradle 8.13, JDK 17 and `minSdk = 26`. CI assembles JVM tests/lint, debug APK, Android-test APK, and an unsigned minified release, then checks integrity, 16 KiB alignment, expected signatures, and hashes. Separately, the local signed `0.1.7` QA candidate passed signature continuity, ZIP, and 16 KiB ZIP/ELF checks. |
 
 ## Remaining gaps
 
@@ -66,8 +67,9 @@ smoke are still pending.
 
 ### Release and runtime verification
 
-- Production-signed minified release and signer-certificate match to `0.1.6`.
-- Upgrade installation over `0.1.6` with saved connections preserved.
+- Upgrade installation of the signed `0.1.7` candidate over `0.1.6`, with
+  saved connections preserved. Its package ID, increasing version code, and
+  identical signer are statically verified prerequisites, not an install test.
 - Android 14, 15, and 16 device behavior, including Samsung background policy,
   edge-to-edge, predictive Back, rotation, resizing, and keyboard insets.
 - Execution of the Android instrumentation test APK on a device/emulator. The

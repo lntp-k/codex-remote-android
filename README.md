@@ -49,7 +49,7 @@ endorsed by OpenAI. Codex and OpenAI are trademarks of their respective owner.
 ## Build
 
 Open this directory in Android Studio, or run `./gradlew assembleDebug` with
-JDK 17 and Android SDK 35 installed.
+JDK 17 and Android SDK 36 installed.
 
 Run the device-side regression suite on a connected emulator or Android device:
 
