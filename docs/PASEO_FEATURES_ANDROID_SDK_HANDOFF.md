@@ -8,6 +8,8 @@
 - Implementation branch: `agent/paseo-android16-session-registry`
 - Pre-`0.1.8` source parent: `dbf1aae`
   (`Prepare signed Android 0.1.7 release candidate`)
+- `0.1.8` Android recovery implementation commit: `a330b01`
+  (`Keep SSH sessions across Android network handoffs`)
 
 ## 0. 한국어 요약
 

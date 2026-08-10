@@ -148,6 +148,7 @@ It remains a QA candidate rather than a device-validated production release.
 
 | Check | Status / evidence |
 | --- | --- |
+| Source commit | `a330b01` (`Keep SSH sessions across Android network handoffs`) |
 | Version | `0.1.8` / `versionCode = 9` |
 | JVM unit tests | 249 tests; 0 failures, 0 errors, 0 skipped |
 | Lint | 0 errors, 22 non-blocking warnings |
