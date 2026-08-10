@@ -3,6 +3,7 @@ package com.codex.remote.data.rpc
 import com.codex.remote.domain.TimelineKind
 import com.codex.remote.domain.ThreadGoalStatus
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -115,6 +116,33 @@ class CodexRpcParsingTest {
     }
 
     @Test
+    fun rejectsCoercedOrBlankThreadGoalAndAuthorizationProfileIdentities() {
+        listOf("7", "true", "\" \"").forEach { malformedId ->
+            assertNull(
+                CodexRpcClient.parseThread(
+                    json.parseToJsonElement(
+                        """{"id":$malformedId,"preview":"Remote task"}""",
+                    ),
+                ),
+            )
+            assertNull(
+                CodexRpcClient.parseThreadGoal(
+                    json.parseToJsonElement(
+                        """{"threadId":$malformedId,"objective":"Ship it","status":"active"}""",
+                    ),
+                ),
+            )
+            assertNull(
+                CodexRpcClient.parsePermissionProfile(
+                    json.parseToJsonElement(
+                        """{"id":$malformedId,"description":"Workspace","allowed":true}""",
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Test
     fun preservesContextCompactionInImportedHistory() {
         val item = parse("""{"type":"contextCompaction","id":"compact-1"}""")
 
@@ -205,6 +233,155 @@ class CodexRpcParsingTest {
         assertEquals("active", set["status"]?.jsonPrimitive?.content)
         assertTrue(!set.containsKey("tokenBudget"))
         assertEquals("thread-1", clear["threadId"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun retainsTheStartedTurnIdentityFromCurrentAndLegacyResponses() {
+        val current = json.parseToJsonElement(
+            """{"turn":{"id":"turn-current"}}""",
+        ).jsonObject
+        val legacy = json.parseToJsonElement(
+            """{"turnId":"turn-legacy"}""",
+        ).jsonObject
+        val malformed = json.parseToJsonElement(
+            """{"turn":{"id":7}}""",
+        ).jsonObject
+
+        assertEquals("turn-current", CodexRpcClient.startedTurnId(current))
+        assertEquals("turn-legacy", CodexRpcClient.startedTurnId(legacy))
+        assertNull(CodexRpcClient.startedTurnId(malformed))
+    }
+
+    @Test
+    fun importedTimelineDoesNotCoerceTypedTurnIdentities() {
+        listOf("7", "true", "\" \"").forEach { malformedTurnId ->
+            val turns = json.parseToJsonElement(
+                """[{"id":$malformedTurnId,"items":[{"type":"agentMessage","id":"item-1","text":"done"}]}]""",
+            ).jsonArray
+
+            val item = CodexRpcClient.parseTurnsTimeline(turns, descending = false).single()
+
+            assertNull(item.turnId)
+        }
+    }
+
+    @Test
+    fun turnLifecycleNotificationsRequireExactStringIdentities() {
+        val valid = CodexRpcClient.turnRunningEvent(
+            json.parseToJsonElement(
+                """{"threadId":"thread-1","turn":{"id":"turn-1"}}""",
+            ).jsonObject,
+            running = true,
+        )
+        val malformedThread = CodexRpcClient.turnRunningEvent(
+            json.parseToJsonElement(
+                """{"threadId":7,"turn":{"id":"turn-2"}}""",
+            ).jsonObject,
+            running = false,
+        )
+        val malformedTurn = CodexRpcClient.turnRunningEvent(
+            json.parseToJsonElement(
+                """{"threadId":"thread-3","turn":{"id":true}}""",
+            ).jsonObject,
+            running = false,
+        )
+
+        assertEquals("thread-1", valid.threadId)
+        assertEquals("turn-1", valid.turnId)
+        assertTrue(valid.running)
+        assertNull(malformedThread.threadId)
+        assertEquals("turn-2", malformedThread.turnId)
+        assertEquals("thread-3", malformedTurn.threadId)
+        assertNull(malformedTurn.turnId)
+    }
+
+    @Test
+    fun failureNotificationsPreserveOnlyExactThreadAndTurnIdentities() {
+        val completed = CodexRpcClient.turnCompletedFailureEvent(
+            json.parseToJsonElement(
+                """{"threadId":"thread-a","turn":{"id":"turn-a","error":{"message":"failed"}}}""",
+            ).jsonObject,
+        )
+        val malformedCompleted = CodexRpcClient.turnCompletedFailureEvent(
+            json.parseToJsonElement(
+                """{"threadId":7,"turn":{"id":true,"error":{"message":"failed"}}}""",
+            ).jsonObject,
+        )
+        val generic = CodexRpcClient.genericFailureEvent(
+            json.parseToJsonElement(
+                """{"threadId":"thread-b","turnId":"turn-b","error":{"message":"broken"}}""",
+            ).jsonObject,
+        )
+        val malformedGeneric = CodexRpcClient.genericFailureEvent(
+            json.parseToJsonElement(
+                """{"threadId":false,"turnId":9,"error":{"message":"broken"}}""",
+            ).jsonObject,
+        )
+        val absentLegacyGeneric = CodexRpcClient.genericFailureEvent(
+            json.parseToJsonElement(
+                """{"threadId":"thread-c","error":{"message":"legacy"}}""",
+            ).jsonObject,
+        )
+
+        assertEquals("thread-a", completed?.threadId)
+        assertEquals("turn-a", completed?.turnId)
+        assertEquals("failed", completed?.message)
+        assertEquals(AppServerEvent.FailureTurnIdStatus.EXACT, completed?.turnIdStatus)
+        assertNull(malformedCompleted?.threadId)
+        assertNull(malformedCompleted?.turnId)
+        assertEquals(AppServerEvent.FailureTurnIdStatus.INVALID, malformedCompleted?.turnIdStatus)
+        assertEquals("thread-b", generic.threadId)
+        assertEquals("turn-b", generic.turnId)
+        assertEquals(AppServerEvent.FailureTurnIdStatus.EXACT, generic.turnIdStatus)
+        assertNull(malformedGeneric.threadId)
+        assertNull(malformedGeneric.turnId)
+        assertEquals(AppServerEvent.FailureTurnIdStatus.INVALID, malformedGeneric.turnIdStatus)
+        assertEquals("thread-c", absentLegacyGeneric.threadId)
+        assertNull(absentLegacyGeneric.turnId)
+        assertEquals(AppServerEvent.FailureTurnIdStatus.LEGACY_ABSENT, absentLegacyGeneric.turnIdStatus)
+    }
+
+    @Test
+    fun retainsExactThreadIdentityAndMetadataFromThreadStartedNotification() {
+        val params = json.parseToJsonElement(
+            """{"thread":{"id":"thread-1","name":"Remote work","cwd":"/srv/app","updatedAt":42,"status":{"type":"active"}}}""",
+        ).jsonObject
+
+        val event = CodexRpcClient.threadStartedEvent(params) as AppServerEvent.ThreadStarted
+
+        assertEquals("thread-1", event.threadId)
+        assertEquals("Remote work", event.thread?.title)
+        assertEquals("/srv/app", event.thread?.cwd)
+        assertEquals("active", event.thread?.status)
+    }
+
+    @Test
+    fun retainsStrictTopLevelThreadIdentityWhenMetadataIsUnavailable() {
+        val params = json.parseToJsonElement(
+            """{"threadId":"thread-2"}""",
+        ).jsonObject
+
+        val event = CodexRpcClient.threadStartedEvent(params) as AppServerEvent.ThreadStarted
+
+        assertEquals("thread-2", event.threadId)
+        assertNull(event.thread)
+    }
+
+    @Test
+    fun fallsBackToRefreshForMalformedOrConflictingThreadStartedIdentity() {
+        val blank = json.parseToJsonElement(
+            """{"threadId":" "}""",
+        ).jsonObject
+        val numeric = json.parseToJsonElement(
+            """{"threadId":7}""",
+        ).jsonObject
+        val conflicting = json.parseToJsonElement(
+            """{"threadId":"thread-1","thread":{"id":"thread-2"}}""",
+        ).jsonObject
+
+        assertEquals(AppServerEvent.ThreadsChanged, CodexRpcClient.threadStartedEvent(blank))
+        assertEquals(AppServerEvent.ThreadsChanged, CodexRpcClient.threadStartedEvent(numeric))
+        assertEquals(AppServerEvent.ThreadsChanged, CodexRpcClient.threadStartedEvent(conflicting))
     }
 
     private fun parse(source: String) = CodexRpcClient.parseTimelineItem(json.parseToJsonElement(source))

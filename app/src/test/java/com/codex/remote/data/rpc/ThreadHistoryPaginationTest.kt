@@ -73,6 +73,61 @@ class ThreadHistoryPaginationTest {
     }
 
     @Test
+    fun emptyInProgressTurnRetainsItsAuthoritativeIdentity() {
+        val turns = json.parseToJsonElement(
+            """[{"id":"turn-running","status":"inProgress","items":[]}]""",
+        ).jsonArray
+
+        assertTrue(CodexRpcClient.parseTurnsTimeline(turns, descending = false).isEmpty())
+        assertEquals("turn-running", CodexRpcClient.parseActiveTurnId(turns))
+    }
+
+    @Test
+    fun completedOnlyTurnsDoNotBecomeTheActiveTurn() {
+        val turns = json.parseToJsonElement(
+            """[
+                {"id":"turn-completed","status":"completed","items":[]},
+                {"id":"turn-failed","status":"failed","items":[]}
+            ]""",
+        ).jsonArray
+
+        assertNull(CodexRpcClient.parseActiveTurnId(turns))
+    }
+
+    @Test
+    fun malformedOrMissingActiveTurnIdsFailClosed() {
+        val malformedActiveTurns = listOf(
+            """[{"status":"inProgress","items":[]}]""",
+            """[{"id":"","status":"running","items":[]}]""",
+            """[{"id":7,"status":"started","items":[]}]""",
+            """[
+                {"id":"turn-a","status":"inProgress","items":[]},
+                {"id":"turn-b","status":"running","items":[]}
+            ]""",
+        )
+
+        malformedActiveTurns.forEach { source ->
+            val turns = json.parseToJsonElement(source).jsonArray
+            assertNull(CodexRpcClient.parseActiveTurnId(turns))
+        }
+    }
+
+    @Test
+    fun activeTurnStatusCompatibilityDoesNotInferFromUnrelatedTurns() {
+        listOf("inProgress", "running", "started").forEach { status ->
+            val turns = json.parseToJsonElement(
+                """[
+                    {"id":"turn-completed","status":"completed","items":[]},
+                    {"id":"turn-active","status":"$status","items":[]},
+                    {"items":[]}
+                ]""",
+            ).jsonArray
+
+            assertEquals("turn-active", CodexRpcClient.parseActiveTurnId(turns))
+        }
+    }
+
+    @Test
     fun reusedItemIdsInDifferentTurnsRemainDistinct() {
         val older = TimelineItem("same-item", TimelineKind.FILE_CHANGE, turnId = "turn-old")
         val newer = TimelineItem("same-item", TimelineKind.FILE_CHANGE, turnId = "turn-new")

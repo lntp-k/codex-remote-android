@@ -1,15 +1,34 @@
 package com.codex.remote
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.codex.remote.data.rpc.AppServerEvent
 import com.codex.remote.data.rpc.CodexRpcClient
+import com.codex.remote.data.rpc.FailureKind
+import com.codex.remote.data.rpc.RpcException
+import com.codex.remote.data.ssh.HostKeyChangedException
+import com.codex.remote.data.ssh.RemoteCodexUnavailableException
 import com.codex.remote.data.ssh.SshAppServerTransportFactory
 import com.codex.remote.data.ssh.UnknownHostKeyException
 import com.codex.remote.data.store.ConnectionStore
+import com.codex.remote.connection.ConnectionMaintenanceStore
+import com.codex.remote.connection.NetworkHandoffDisposition
+import com.codex.remote.connection.NetworkRecoveryAction
+import com.codex.remote.connection.NetworkTransition
+import com.codex.remote.connection.NetworkTransitionTracker
+import com.codex.remote.connection.ReconnectAttemptLedger
+import com.codex.remote.connection.ReconnectReadiness
+import com.codex.remote.connection.SshConnectionService
+import com.codex.remote.connection.availableNetworkRequiresHandoff
+import com.codex.remote.connection.networkHandoffDisposition
+import com.codex.remote.connection.reconnectReadiness
+import com.codex.remote.connection.networkRecoveryAction
 import com.codex.remote.domain.AppUiState
-import com.codex.remote.domain.ApprovalEnqueueStatus
 import com.codex.remote.domain.ApprovalFileItemKey
 import com.codex.remote.domain.ApprovalQueue
 import com.codex.remote.domain.ApprovalQueueKey
@@ -32,6 +51,7 @@ import com.codex.remote.domain.SavedConnection
 import com.codex.remote.domain.TimelineItem
 import com.codex.remote.domain.TimelineKind
 import com.codex.remote.domain.ThreadGoalStatus
+import com.codex.remote.domain.ThreadSessionIndicator
 import com.codex.remote.domain.approvalFileSnapshotRetainedCharCount
 import com.codex.remote.domain.fileApprovalSnapshotOrNull
 import com.codex.remote.domain.groupThreadsByProject
@@ -40,9 +60,26 @@ import com.codex.remote.domain.composerToken
 import com.codex.remote.domain.containsComposerToken
 import com.codex.remote.domain.withThreadArchived
 import com.codex.remote.domain.withThreadRenamed
+import com.codex.remote.session.OwnedApproval
+import com.codex.remote.session.SessionEventRouter
+import com.codex.remote.session.SessionRegistry
+import com.codex.remote.session.SessionRegistryMutation
+import com.codex.remote.session.SessionRequestTracker
+import com.codex.remote.session.SessionRouteDisposition
+import com.codex.remote.session.SessionSettings
+import com.codex.remote.session.SessionState
+import com.codex.remote.session.SessionStreamStatus
+import com.codex.remote.session.TurnStartToken
+import com.codex.remote.session.TurnStartResponseDisposition
+import com.codex.remote.session.retainedCharacterCount
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -52,16 +89,39 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.io.IOException
 import java.util.UUID
+import net.schmizz.sshj.common.DisconnectReason
+import net.schmizz.sshj.common.SSHException
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val store = ConnectionStore(application)
+    private val maintenanceStore = ConnectionMaintenanceStore(application)
+    private val connectivityManager = application.getSystemService(ConnectivityManager::class.java)
+    private val powerManager = application.getSystemService(PowerManager::class.java)
     private val transportFactory = SshAppServerTransportFactory(application)
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
+    private val transportCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var rpc: CodexRpcClient? = null
     private var eventJob: Job? = null
+    private var connectionJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var reconnectStabilityJob: Job? = null
+    private var networkHandoffJob: Job? = null
+    private var sessionRegistry = SessionRegistry()
+    private val sessionRequestTracker = SessionRequestTracker()
+    private val reconnectAttempts = ReconnectAttemptLedger()
+    private val networkTransitions = NetworkTransitionTracker()
+    private var shouldMaintainConnection = false
+    private var hasObservedNetworkState = false
+    private var networkHandoffPending = false
+    private var activeConnectionAttemptNetworkId: Long? = null
+    private var reconnectHadUnconfirmedWork = false
+    private var reconnectCircuitBreakerPaused = false
+    private var isDeviceIdleMode = powerManager.isDeviceIdleMode
+    private var pendingReconnectSelection: ReconnectSelection? = null
     private var didRestoreLastConnection = false
     // Keep response flush/completion and inbound approval enqueue in one order so a wire ID
     // cannot be reused against an entry that is still locally outstanding.
@@ -73,7 +133,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val sortedConnections = connections.sortedByDescending { it.lastUsedAt }
                 val connectionToRestore = if (!didRestoreLastConnection) {
                     didRestoreLastConnection = true
-                    sortedConnections.lastUsedConnectionOrNull()
+                    val desiredConnectionId = maintenanceStore.desiredConnectionId()
+                    sortedConnections.desiredConnectionOrNull(desiredConnectionId).also { desired ->
+                        if (desiredConnectionId != null) {
+                            if (desired == null) {
+                                val cleared = maintenanceStore.clear()
+                                Log.e(
+                                    CONNECTION_LOG_TAG,
+                                    "state=maintenance_target_missing clear_persisted=$cleared",
+                                )
+                                SshConnectionService.stop(getApplication())
+                            }
+                        }
+                    }
                 } else {
                     null
                 }
@@ -136,13 +208,119 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connect(connection: SavedConnection) {
-        viewModelScope.launch {
-            disconnectInternal(clearActive = false)
+        didRestoreLastConnection = true
+        if (!maintenanceStore.remember(connection.id)) {
+            Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_persist_failed")
+            _state.update { current ->
+                if (
+                    current.activeConnection != null &&
+                    current.connectionStatus != ConnectionStatus.DISCONNECTED &&
+                    current.connectionStatus != ConnectionStatus.ERROR
+                ) {
+                    current.copy(notice = "Could not save the new background connection target; the current connection was kept.")
+                } else {
+                    current.copy(
+                        activeConnection = connection,
+                        connectionStatus = ConnectionStatus.ERROR,
+                        connectionMessage = "Could not persist the background connection target. Tap Connect to retry.",
+                        showConnections = true,
+                        notice = "Connection paused because its recovery target could not be saved.",
+                    )
+                }
+            }
+            return
+        }
+        reconnectJob?.cancel()
+        reconnectJob = null
+        val currentDefaultNetworkId = runCatching {
+            connectivityManager.activeNetwork?.networkHandle
+        }.getOrNull()
+        networkTransitions.reset(currentDefaultNetworkId)
+        hasObservedNetworkState = true
+        activeConnectionAttemptNetworkId = currentDefaultNetworkId
+        reconnectAttempts.reset()
+        reconnectCircuitBreakerPaused = false
+        pendingReconnectSelection = null
+        networkHandoffPending = false
+        networkHandoffJob?.cancel()
+        networkHandoffJob = null
+        shouldMaintainConnection = true
+        if (!SshConnectionService.start(getApplication())) {
+            shouldMaintainConnection = false
+            if (!maintenanceStore.clear()) {
+                Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed reason=fgs_start")
+            }
+            disconnectInternal(clearActive = true)
             _state.update {
                 it.copy(
                     activeConnection = connection,
-                    connectionStatus = ConnectionStatus.CONNECTING,
-                    connectionMessage = "Connecting to ${connection.host}…",
+                    connectionStatus = ConnectionStatus.ERROR,
+                    connectionMessage = "Android blocked background connection startup. Open Codex Remote and tap Connect again.",
+                    showConnections = true,
+                    notice = "Connection paused because Android could not start its foreground service.",
+                )
+            }
+            return
+        }
+        when (
+            reconnectReadiness(
+                isDeviceIdleMode = isDeviceIdleMode,
+                hasObservedNetworkState = hasObservedNetworkState,
+                hasAvailableNetwork = networkTransitions.hasAvailableNetwork,
+            )
+        ) {
+            ReconnectReadiness.WAITING_FOR_DEVICE_WAKE -> {
+                _state.update {
+                    it.copy(
+                        activeConnection = connection,
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for the device to wake…",
+                        showConnections = false,
+                    )
+                }
+                return
+            }
+            ReconnectReadiness.WAITING_FOR_NETWORK -> {
+                _state.update {
+                    it.copy(
+                        activeConnection = connection,
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for a network…",
+                        showConnections = false,
+                    )
+                }
+                return
+            }
+            ReconnectReadiness.READY -> Unit
+        }
+        startConnectionAttempt(connection, isReconnect = false)
+    }
+
+    private fun startConnectionAttempt(connection: SavedConnection, isReconnect: Boolean) {
+        connectionJob = viewModelScope.launch {
+            networkHandoffPending = false
+            networkHandoffJob?.cancel()
+            networkHandoffJob = null
+            val attemptNetworkId = runCatching {
+                connectivityManager.activeNetwork?.networkHandle
+            }.getOrNull()
+            activeConnectionAttemptNetworkId = attemptNetworkId
+            disconnectInternal(clearActive = false, suspendMaintenance = false)
+            val connectionEpoch = sessionRequestTracker.connectionGeneration
+            var attemptClient: CodexRpcClient? = null
+            _state.update {
+                it.copy(
+                    activeConnection = connection,
+                    connectionStatus = if (isReconnect) {
+                        ConnectionStatus.RECONNECTING
+                    } else {
+                        ConnectionStatus.CONNECTING
+                    },
+                    connectionMessage = if (isReconnect) {
+                        "Reconnecting to ${connection.host}…"
+                    } else {
+                        "Connecting to ${connection.host}…"
+                    },
                     showConnections = false,
                     timeline = emptyList(),
                     olderHistoryCursor = null,
@@ -171,8 +349,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     collaborationModes = emptyList(),
                     selectedCollaborationMode = "default",
                     permissionProfiles = emptyList(),
-                    selectedPermissionProfile = null,
-                    approvalsReviewer = "user",
+                    selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                    approvalPolicy = SAFE_APPROVAL_POLICY,
+                    approvalsReviewer = SAFE_APPROVALS_REVIEWER,
                     remoteServer = null,
                     remoteAccount = null,
                     remoteDeviceLogin = null,
@@ -189,15 +368,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     isStatusLoading = false,
                     statusError = null,
                     pendingHostKeyFingerprint = null,
-                    notice = null,
+                    notice = if (isReconnect) it.notice else null,
                 )
             }
             runCatching {
                 val secrets = withContext(Dispatchers.IO) { store.decrypt(connection) }
                 val transport = transportFactory.open(connection, secrets)
                 val client = CodexRpcClient(transport)
+                if (sessionRequestTracker.connectionGeneration != connectionEpoch) {
+                    closeClientInBackground(client)
+                    throw SupersededConnectionException()
+                }
+                attemptClient = client
                 rpc = client
-                observeEvents(client)
+                observeEvents(client, connectionEpoch)
                 val server = withTimeout(20_000) { client.initialize() }
                 val account = withTimeout(20_000) { client.readAccount() }
                 val models = withTimeout(30_000) { client.listModels() }
@@ -208,12 +392,26 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val permissionProfiles = runCatching {
                     withTimeout(20_000) { client.listPermissionProfiles(null) }
                 }.getOrDefault(emptyList())
+                if (!isCurrentConnection(client, connectionEpoch)) throw SupersededConnectionException()
                 store.recordUsed(connection.id)
+                if (!isCurrentConnection(client, connectionEpoch)) throw SupersededConnectionException()
                 ConnectionBootstrap(server, account, models, threads, collaborationModes, permissionProfiles)
             }.onSuccess { bootstrap ->
+                if (sessionRequestTracker.connectionGeneration != connectionEpoch || rpc !== attemptClient) {
+                    return@onSuccess
+                }
                 val projects = groupThreadsByProject(bootstrap.threads)
                 val selectedModel = bootstrap.models.firstOrNull { model -> model.isDefault }
                     ?: bootstrap.models.firstOrNull()
+                val reconnectSelection = pendingReconnectSelection
+                val hadUnconfirmedWork = reconnectHadUnconfirmedWork
+                val selectedProjectPath = reconnectSelection?.projectPath
+                    ?.takeIf { path -> projects.any { it.path == path } }
+                    ?: projects.firstOrNull()?.path
+                val connectedNetworkChanged = networkTransitions.currentNetworkId
+                    ?.let { currentNetworkId -> currentNetworkId != attemptNetworkId }
+                    ?: false
+                val needsImmediateNetworkHandoff = networkHandoffPending || connectedNetworkChanged
                 _state.update {
                     it.copy(
                         connectionStatus = ConnectionStatus.CONNECTED,
@@ -230,7 +428,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         selectedCollaborationMode = bootstrap.collaborationModes
                             .firstOrNull { mode -> mode.mode == "default" }?.mode ?: "default",
                         permissionProfiles = bootstrap.permissionProfiles,
-                        selectedPermissionProfile = null,
+                        selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                        approvalPolicy = SAFE_APPROVAL_POLICY,
+                        approvalsReviewer = SAFE_APPROVALS_REVIEWER,
                         remoteServer = bootstrap.server,
                         remoteAccount = bootstrap.account,
                         threads = bootstrap.threads,
@@ -239,19 +439,58 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         plugins = emptyList(),
                         isComposerCatalogLoading = true,
                         composerCatalogError = null,
-                        selectedProjectPath = projects.firstOrNull()?.path,
+                        selectedProjectPath = selectedProjectPath,
+                        showConnections = false,
+                        notice = when {
+                            needsImmediateNetworkHandoff -> {
+                                "Network changed while connecting; reopening SSH on the current route."
+                            }
+                            !isReconnect -> it.notice
+                            hadUnconfirmedWork -> {
+                                "Connection restored; verify the operation that was in flight while the connection was interrupted."
+                            }
+                            else -> "Connection restored"
+                        },
                     )
                 }
+                if (needsImmediateNetworkHandoff) {
+                    requestNetworkHandoff(connection)
+                    return@onSuccess
+                }
+                reconnectStabilityJob?.cancel()
+                if (isReconnect) {
+                    reconnectStabilityJob = viewModelScope.launch {
+                        delay(RECONNECT_STABILITY_WINDOW_MILLIS)
+                        if (rpc === attemptClient && _state.value.connectionStatus == ConnectionStatus.CONNECTED) {
+                            reconnectAttempts.reset()
+                            Log.i(CONNECTION_LOG_TAG, "state=stable reconnect_attempt_reset=true")
+                        }
+                    }
+                } else {
+                    reconnectAttempts.reset()
+                }
+                pendingReconnectSelection = null
+                reconnectHadUnconfirmedWork = false
+                reconnectCircuitBreakerPaused = false
                 refreshComposerCatalog()
+                reconnectSelection?.threadId
+                    ?.let { threadId -> bootstrap.threads.firstOrNull { it.id == threadId } }
+                    ?.let(::selectThread)
             }.onFailure { error ->
+                if (error.isCancellation()) return@onFailure
+                if (sessionRequestTracker.connectionGeneration != connectionEpoch || rpc !== attemptClient) {
+                    closeClientInBackground(attemptClient)
+                    return@onFailure
+                }
                 eventJob?.cancel()
                 eventJob = null
-                rpc?.close()
+                closeClientInBackground(rpc)
                 rpc = null
                 val unknownHostKey = generateSequence(error) { it.cause }
                     .filterIsInstance<UnknownHostKeyException>()
                     .firstOrNull()
                 if (unknownHostKey != null) {
+                    suspendConnectionMaintenance()
                     _state.update {
                         it.copy(
                             connectionStatus = ConnectionStatus.ERROR,
@@ -259,7 +498,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             pendingHostKeyFingerprint = unknownHostKey.fingerprint,
                         )
                     }
+                } else if (error.isRetryableConnectionFailure() && shouldMaintainConnection) {
+                    scheduleReconnect(friendlyError(error))
                 } else {
+                    suspendConnectionMaintenance()
                     _state.update {
                         it.copy(
                             connectionStatus = ConnectionStatus.ERROR,
@@ -275,8 +517,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun trustPendingHostKey() {
         val connection = _state.value.activeConnection ?: return
         val fingerprint = _state.value.pendingHostKeyFingerprint ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
             store.recordFingerprint(connection.id, fingerprint)
+            if (!sessionRequestTracker.isCurrentConnection(connectionGeneration) ||
+                _state.value.activeConnection?.id != connection.id ||
+                _state.value.pendingHostKeyFingerprint != fingerprint
+            ) {
+                return@launch
+            }
             _state.update { it.copy(pendingHostKeyFingerprint = null) }
             connect(connection.copy(hostKeyFingerprint = fingerprint))
         }
@@ -291,45 +540,435 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() {
-        viewModelScope.launch { disconnectInternal(clearActive = true) }
+        didRestoreLastConnection = true
+        viewModelScope.launch {
+            disconnectInternal(clearActive = true)
+        }
     }
 
-    private fun disconnectInternal(clearActive: Boolean) {
-        eventJob?.cancel()
-        eventJob = null
-        rpc?.close()
-        rpc = null
-        _state.update { it.afterDisconnect(clearActive) }
-    }
-
-    fun newThread() {
-        _state.update { state ->
-            val projectPath = state.selectedProjectPath ?: state.projects.firstOrNull()?.path
-            if (state.remoteAccount?.canRunCodex != true) {
-                state.copy(notice = "Sign in to remote Codex first")
-            } else if (projectPath.isNullOrBlank()) {
-                state.copy(notice = "No remote Codex project is available for a new task")
-            } else {
-                state.copy(
-                    selectedProjectPath = projectPath,
-                    selectedThreadId = null,
-                    threadGoal = null,
-                    isGoalLoading = false,
-                    goalError = null,
-                    threadTokenUsage = null,
-                    timeline = emptyList(),
-                    olderHistoryCursor = null,
-                    hasOlderHistory = false,
-                    isOlderHistoryLoading = false,
-                    olderHistoryError = null,
-                    consumedHistoryCursors = emptySet(),
-                    selectedCollaborationMode = state.defaultCollaborationMode(),
+    fun onDefaultNetworkAvailable(networkId: Long) {
+        viewModelScope.launch {
+            hasObservedNetworkState = true
+            val transition = networkTransitions.onAvailable(networkId)
+            val connection = _state.value.activeConnection ?: return@launch
+            if (!shouldMaintainConnection) return@launch
+            if (isDeviceIdleMode) {
+                Log.i(CONNECTION_LOG_TAG, "state=network_available recovery_deferred=device_idle")
+                return@launch
+            }
+            val availableNetworkMayRequireHandoff = when (transition) {
+                NetworkTransition.CHANGED,
+                NetworkTransition.RESTORED,
+                NetworkTransition.INITIAL -> availableNetworkRequiresHandoff(
+                    activeConnectionAttemptNetworkId,
+                    networkId,
                 )
+                NetworkTransition.UNCHANGED,
+                NetworkTransition.LOST,
+                NetworkTransition.STALE_LOSS -> false
+            }
+            if (availableNetworkMayRequireHandoff && connectionJob?.isActive == true) {
+                networkHandoffPending = true
+                Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=connection_attempt")
+            }
+            val recoveryAction = if (
+                transition == NetworkTransition.INITIAL &&
+                _state.value.connectionStatus == ConnectionStatus.CONNECTED &&
+                availableNetworkMayRequireHandoff
+            ) {
+                NetworkRecoveryAction.REQUEST_HANDOFF
+            } else {
+                networkRecoveryAction(
+                    transition = transition,
+                    connectionStatus = _state.value.connectionStatus,
+                    connectionAttemptActive = connectionJob?.isActive == true,
+                )
+            }.let { action ->
+                if (action == NetworkRecoveryAction.REQUEST_HANDOFF && !availableNetworkMayRequireHandoff) {
+                    NetworkRecoveryAction.NONE
+                } else {
+                    action
+                }
+            }
+            when (recoveryAction) {
+                NetworkRecoveryAction.REQUEST_HANDOFF -> {
+                    requestNetworkHandoff(connection)
+                }
+                NetworkRecoveryAction.SCHEDULE_RECONNECT -> {
+                    if (reconnectCircuitBreakerPaused) {
+                        reconnectAttempts.reset()
+                        reconnectCircuitBreakerPaused = false
+                        Log.i(CONNECTION_LOG_TAG, "state=reconnect_circuit_breaker_reset reason=network_change")
+                    }
+                    scheduleReconnect(
+                        message = "Network available; restoring the SSH session",
+                        immediate = true,
+                        connection = connection,
+                    )
+                }
+                NetworkRecoveryAction.NONE -> Unit
             }
         }
     }
 
+    fun onDefaultNetworkUnavailable() {
+        viewModelScope.launch {
+            hasObservedNetworkState = true
+            networkTransitions.onUnavailable()
+            if (!shouldMaintainConnection) return@launch
+            networkHandoffJob?.cancel()
+            networkHandoffJob = null
+            networkHandoffPending = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            if (_state.value.connectionStatus == ConnectionStatus.RECONNECTING) {
+                _state.update { it.copy(connectionMessage = "Waiting for a network…") }
+            }
+            Log.i(CONNECTION_LOG_TAG, "state=network_unavailable")
+        }
+    }
+
+    fun onDeviceIdleModeChanged(isIdle: Boolean) {
+        viewModelScope.launch {
+            if (isDeviceIdleMode == isIdle) return@launch
+            isDeviceIdleMode = isIdle
+            if (!shouldMaintainConnection) return@launch
+            if (isIdle) {
+                reconnectJob?.cancel()
+                reconnectJob = null
+                networkHandoffJob?.cancel()
+                networkHandoffJob = null
+                if (_state.value.connectionStatus == ConnectionStatus.RECONNECTING) {
+                    _state.update {
+                        it.copy(
+                            connectionMessage = "Waiting for the device to wake…",
+                            showConnections = false,
+                        )
+                    }
+                }
+                Log.i(CONNECTION_LOG_TAG, "state=device_idle reconnect_deferred=true")
+                return@launch
+            }
+
+            val connection = _state.value.activeConnection ?: return@launch
+            val currentNetworkId = networkTransitions.currentNetworkId
+            if (_state.value.connectionStatus == ConnectionStatus.CONNECTED) {
+                if (
+                    currentNetworkId != null &&
+                    availableNetworkRequiresHandoff(activeConnectionAttemptNetworkId, currentNetworkId)
+                ) {
+                    requestNetworkHandoff(connection)
+                } else {
+                    networkHandoffPending = false
+                }
+            } else if (
+                _state.value.connectionStatus != ConnectionStatus.CONNECTED &&
+                connectionJob?.isActive != true &&
+                (!hasObservedNetworkState || networkTransitions.hasAvailableNetwork)
+            ) {
+                scheduleReconnect(
+                    message = "Device awake; restoring the SSH session",
+                    immediate = true,
+                    connection = connection,
+                )
+            }
+            Log.i(CONNECTION_LOG_TAG, "state=device_awake recovery_checked=true")
+        }
+    }
+
+    private fun requestNetworkHandoff(connection: SavedConnection) {
+        if (!shouldMaintainConnection || _state.value.activeConnection?.id != connection.id) return
+        networkHandoffPending = true
+        networkHandoffJob?.cancel()
+        networkHandoffJob = viewModelScope.launch {
+            delay(NETWORK_CHANGE_DEBOUNCE_MILLIS)
+            var deferWasLogged = false
+            var pendingRpcSinceMillis: Long? = null
+            while (
+                networkHandoffPending &&
+                shouldMaintainConnection &&
+                _state.value.activeConnection?.id == connection.id &&
+                _state.value.connectionStatus == ConnectionStatus.CONNECTED
+            ) {
+                val hasRunningTurn = hasRunningTurn()
+                val hasPendingApproval = hasPendingApproval()
+                val hasPendingRpc = rpc?.hasPendingRequests() == true
+                when {
+                    !hasRunningTurn && !hasPendingApproval && !hasPendingRpc -> {
+                        performNetworkHandoffIfSafe(connection)
+                        return@launch
+                    }
+                    hasRunningTurn || hasPendingApproval -> pendingRpcSinceMillis = null
+                    else -> {
+                        val now = SystemClock.elapsedRealtime()
+                        val since = pendingRpcSinceMillis ?: now.also { pendingRpcSinceMillis = it }
+                        if (now - since >= NETWORK_PENDING_RPC_GRACE_MILLIS) {
+                            reconnectHadUnconfirmedWork = true
+                            performNetworkHandoffIfSafe(connection, allowPendingRpc = true)
+                            return@launch
+                        }
+                    }
+                }
+                if (!deferWasLogged) {
+                    Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
+                    deferWasLogged = true
+                }
+                delay(NETWORK_HANDOFF_RECHECK_MILLIS)
+            }
+        }
+    }
+
+    private fun performNetworkHandoffIfSafe(
+        connection: SavedConnection,
+        allowPendingRpc: Boolean = false,
+    ) {
+        if (
+            !networkHandoffPending ||
+            !shouldMaintainConnection ||
+            _state.value.activeConnection?.id != connection.id ||
+            _state.value.connectionStatus != ConnectionStatus.CONNECTED
+        ) {
+            return
+        }
+        val hasRunningTurn = hasRunningTurn()
+        val hasPendingApproval = hasPendingApproval()
+        val hasPendingRpc = rpc?.hasPendingRequests() == true
+        val canOverridePendingRpc = allowPendingRpc &&
+            !hasRunningTurn &&
+            !hasPendingApproval &&
+            hasPendingRpc
+        if (
+            currentNetworkHandoffDisposition() == NetworkHandoffDisposition.DEFER &&
+            !canOverridePendingRpc
+        ) {
+            Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
+            return
+        }
+        if (suspendForAmbiguousApprovalDelivery()) return
+        networkHandoffPending = false
+        networkHandoffJob = null
+        rememberSelectionForReconnect()
+        disconnectInternal(clearActive = false, suspendMaintenance = false)
+        scheduleReconnect(
+            message = "Network changed; opening SSH on the new route",
+            immediate = true,
+            connection = connection,
+        )
+    }
+
+    private fun currentNetworkHandoffDisposition(): NetworkHandoffDisposition {
+        val hasRunningTurn = hasRunningTurn()
+        val hasPendingApproval = hasPendingApproval()
+        val hasPendingRpc = rpc?.hasPendingRequests() == true
+        return networkHandoffDisposition(hasRunningTurn, hasPendingApproval, hasPendingRpc)
+    }
+
+    private fun hasRunningTurn(): Boolean = _state.value.isTurnRunning ||
+        sessionRegistry.sessions.values.any { it.isTurnRunning }
+
+    private fun hasPendingApproval(): Boolean = sessionRegistry.sessions.values.any {
+        it.approvalQueue.entries.isNotEmpty() || it.approvalQueue.respondingKeys.isNotEmpty()
+    }
+
+    private fun disconnectInternal(clearActive: Boolean, suspendMaintenance: Boolean = true) {
+        if (suspendMaintenance) suspendConnectionMaintenance()
+        reconnectStabilityJob?.cancel()
+        reconnectStabilityJob = null
+        sessionRequestTracker.invalidateConnection()
+        eventJob?.cancel()
+        eventJob = null
+        val detachedClient = rpc
+        rpc = null
+        closeClientInBackground(detachedClient)
+        sessionRegistry = SessionRegistry()
+        _state.update { it.afterDisconnect(clearActive) }
+    }
+
+    private fun suspendConnectionMaintenance() {
+        shouldMaintainConnection = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectStabilityJob?.cancel()
+        reconnectStabilityJob = null
+        networkHandoffJob?.cancel()
+        networkHandoffJob = null
+        networkHandoffPending = false
+        reconnectHadUnconfirmedWork = false
+        reconnectCircuitBreakerPaused = false
+        reconnectAttempts.reset()
+        pendingReconnectSelection = null
+        if (!maintenanceStore.clear()) {
+            Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed")
+        }
+        SshConnectionService.stop(getApplication())
+    }
+
+    private fun rememberSelectionForReconnect() {
+        if (pendingReconnectSelection != null) return
+        val snapshot = _state.value
+        pendingReconnectSelection = ReconnectSelection(
+            projectPath = snapshot.selectedProjectPath,
+            threadId = snapshot.selectedThreadId,
+        )
+    }
+
+    private fun suspendForAmbiguousApprovalDelivery(): Boolean {
+        val responseInFlight = sessionRegistry.sessions.values.any { session ->
+            session.approvalQueue.respondingKeys.isNotEmpty()
+        }
+        if (!responseInFlight) return false
+        val message = "Approval response delivery could not be confirmed; disconnected without retrying."
+        disconnectInternal(clearActive = false)
+        _state.update {
+            it.copy(
+                connectionStatus = ConnectionStatus.ERROR,
+                connectionMessage = message,
+                showConnections = true,
+                notice = message,
+            )
+        }
+        Log.w(CONNECTION_LOG_TAG, "state=suspended reason=approval_delivery_ambiguous")
+        return true
+    }
+
+    private fun scheduleReconnect(
+        message: String,
+        immediate: Boolean = false,
+        connection: SavedConnection? = _state.value.activeConnection,
+    ) {
+        val target = connection ?: return
+        if (!shouldMaintainConnection || _state.value.activeConnection?.id != target.id) return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        when (
+            reconnectReadiness(
+                isDeviceIdleMode = isDeviceIdleMode,
+                hasObservedNetworkState = hasObservedNetworkState,
+                hasAvailableNetwork = networkTransitions.hasAvailableNetwork,
+            )
+        ) {
+            ReconnectReadiness.WAITING_FOR_DEVICE_WAKE -> {
+                _state.update {
+                    it.copy(
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for the device to wake…",
+                        showConnections = false,
+                        notice = message,
+                    )
+                }
+                Log.i(CONNECTION_LOG_TAG, "state=waiting_for_device_wake reason=retry_requested")
+                return
+            }
+            ReconnectReadiness.WAITING_FOR_NETWORK -> {
+                _state.update {
+                    it.copy(
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for a network…",
+                        showConnections = false,
+                        notice = message,
+                    )
+                }
+                Log.i(CONNECTION_LOG_TAG, "state=waiting_for_network reason=retry_requested")
+                return
+            }
+            ReconnectReadiness.READY -> Unit
+        }
+        val attempt = reconnectAttempts.startedAttempts
+        if (!reconnectAttempts.canSchedule()) {
+            val pausedMessage =
+                "Automatic reconnect paused after ${reconnectAttempts.maximumAttempts} failed attempts. It will retry after a network change, or you can tap Connect."
+            reconnectCircuitBreakerPaused = true
+            _state.update {
+                it.copy(
+                    connectionStatus = ConnectionStatus.ERROR,
+                    connectionMessage = pausedMessage,
+                    showConnections = true,
+                    notice = pausedMessage,
+                )
+            }
+            Log.w(CONNECTION_LOG_TAG, "state=suspended reason=reconnect_circuit_breaker")
+            return
+        }
+        val delayMillis = if (immediate) {
+            NETWORK_CHANGE_DEBOUNCE_MILLIS
+        } else {
+            reconnectAttempts.delayMillisForNextAttempt()
+        }
+        val scheduledConnectionGeneration = sessionRequestTracker.connectionGeneration
+        _state.update {
+            it.copy(
+                connectionStatus = ConnectionStatus.RECONNECTING,
+                connectionMessage = "Reconnecting in ${delayMillis / 1_000.0}s…",
+                showConnections = false,
+                notice = message,
+            )
+        }
+        Log.i(
+            CONNECTION_LOG_TAG,
+            "state=reconnect_scheduled attempt=$attempt delay_ms=$delayMillis",
+        )
+        reconnectJob = viewModelScope.launch {
+            delay(delayMillis)
+            if (
+                !shouldMaintainConnection ||
+                _state.value.activeConnection?.id != target.id ||
+                _state.value.connectionStatus == ConnectionStatus.CONNECTED ||
+                connectionJob?.isActive == true ||
+                isDeviceIdleMode ||
+                sessionRequestTracker.connectionGeneration != scheduledConnectionGeneration
+            ) {
+                Log.i(CONNECTION_LOG_TAG, "state=reconnect_skipped reason=stale_timer")
+                return@launch
+            }
+            if (!reconnectAttempts.markStarted(attempt)) return@launch
+            Log.i(CONNECTION_LOG_TAG, "state=reconnect_started attempt=$attempt")
+            startConnectionAttempt(target, isReconnect = true)
+        }
+    }
+
+    fun newThread() {
+        val snapshot = _state.value
+        val projectPath = snapshot.selectedProjectPath ?: snapshot.projects.firstOrNull()?.path
+        if (snapshot.remoteAccount?.canRunCodex != true) {
+            _state.update { it.copy(notice = "Sign in to remote Codex first") }
+            return
+        }
+        if (projectPath.isNullOrBlank()) {
+            _state.update { it.copy(notice = "No remote Codex project is available for a new task") }
+            return
+        }
+        if (!captureSelectedSession()) return
+        sessionRequestTracker.advanceSelection()
+        _state.update { state ->
+            state.copy(
+                selectedProjectPath = projectPath,
+                selectedThreadId = null,
+                threadGoal = null,
+                isGoalLoading = false,
+                goalError = null,
+                threadTokenUsage = null,
+                timeline = emptyList(),
+                olderHistoryCursor = null,
+                hasOlderHistory = false,
+                isOlderHistoryLoading = false,
+                olderHistoryError = null,
+                consumedHistoryCursors = emptySet(),
+                selectedCollaborationMode = state.defaultCollaborationMode(),
+                selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                approvalPolicy = SAFE_APPROVAL_POLICY,
+                approvalsReviewer = SAFE_APPROVALS_REVIEWER,
+            )
+        }
+        if (_state.value.selectedThreadId == null) {
+            sessionRegistry = sessionRegistry.clearSelection()
+            projectSessionRegistry()
+        }
+    }
+
     fun selectProject(project: RemoteProject) {
+        if (!captureSelectedSession()) return
+        sessionRequestTracker.advanceSelection()
+        sessionRegistry = sessionRegistry.clearSelection()
         _state.update {
             it.copy(
                 selectedProjectPath = project.path,
@@ -345,108 +984,195 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 olderHistoryError = null,
                 consumedHistoryCursors = emptySet(),
                 selectedCollaborationMode = it.defaultCollaborationMode(),
+                selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                approvalPolicy = SAFE_APPROVAL_POLICY,
+                approvalsReviewer = SAFE_APPROVALS_REVIEWER,
             )
         }
+        projectSessionRegistry()
     }
 
     fun selectThread(thread: RemoteThread) {
         if (_state.value.activeConnection == null) return
         val client = rpc ?: return
-        viewModelScope.launch {
-            val projectPath = _state.value.projects
-                .firstOrNull { project -> project.threads.any { it.id == thread.id } }
-                ?.path
-                ?: thread.cwd
-            _state.update {
-                it.copy(
-                    selectedProjectPath = projectPath,
-                    selectedThreadId = thread.id,
-                    threadGoal = null,
-                    isGoalLoading = true,
-                    goalError = null,
-                    threadTokenUsage = null,
-                    timeline = emptyList(),
-                    olderHistoryCursor = null,
-                    hasOlderHistory = false,
-                    isOlderHistoryLoading = false,
-                    olderHistoryError = null,
-                    consumedHistoryCursors = emptySet(),
-                    isBusy = true,
+        sessionRequestTracker.advanceSelection()
+        val loadToken = sessionRequestTracker.beginSessionLoad(thread.id)
+        fun isCurrentRequest(): Boolean =
+            rpc === client && sessionRequestTracker.isCurrent(loadToken)
+        if (!captureSelectedSession()) return
+        val previous = _state.value
+        val wasCached = thread.id in sessionRegistry.sessions
+        val selected = sessionRegistry.selectThread(thread)
+        if (!selected.applied) {
+            sessionRegistry = selected.registry
+            _state.update { it.copy(notice = "This task could not be cached safely.") }
+            return
+        }
+        sessionRegistry = selected.registry
+        if (!wasCached) {
+            val initialized = sessionRegistry.updateSession(thread.id, markUnread = false) { session ->
+                session.copy(
+                    settings = previous.defaultSessionSettings(),
                     isTurnRunning = thread.status.isRemoteThreadActive(),
-                    activeTurnId = null,
+                    streamStatus = if (thread.status.isRemoteThreadActive()) {
+                        SessionStreamStatus.RUNNING
+                    } else {
+                        SessionStreamStatus.IDLE
+                    },
                 )
             }
+            if (!applySessionMutation(initialized, "This task could not be initialized safely.")) return
+        }
+        val projectPath = previous.projects
+            .firstOrNull { project -> project.threads.any { it.id == thread.id } }
+            ?.path
+            ?: thread.cwd
+        _state.update { state ->
+            state.withSessionRegistry(sessionRegistry).copy(
+                selectedProjectPath = projectPath,
+                selectedThreadId = thread.id,
+                isGoalLoading = true,
+                goalError = null,
+                isBusy = true,
+            )
+        }
+        viewModelScope.launch {
             val session = runCatching { client.resumeThread(thread.id, thread.cwd) }
                 .getOrElse { error ->
-                    _state.update { state ->
-                        if (state.selectedThreadId == thread.id) state.copy(isGoalLoading = false) else state
-                    }
-                    showError(error)
-                    return@launch
-                }
-            _state.update { state ->
-                if (state.selectedThreadId != thread.id) return@update state
-                val model = state.models.firstOrNull { it.id == session.model }
-                val timeline = mergeTimelineHistory(session.timeline, state.timeline)
-                val approvalFileItems = state.approvalFileItems.recordFileApprovalItems(thread.id, timeline)
-                state.copy(
-                    timeline = timeline,
-                    approvalQueue = state.approvalQueue.bindFileChangeSnapshots(timeline, thread.id),
-                    approvalFileItems = approvalFileItems,
-                    olderHistoryCursor = session.olderHistoryCursor,
-                    hasOlderHistory = session.olderHistoryCursor != null,
-                    isOlderHistoryLoading = false,
-                    olderHistoryError = null,
-                    consumedHistoryCursors = emptySet(),
-                    isBusy = false,
-                    selectedModel = model?.id ?: state.selectedModel,
-                    selectedReasoningEffort = session.reasoningEffort
-                        ?.takeIf { effort -> model?.supports(effort) == true }
-                        ?: model?.preferredReasoningEffort()
-                        ?: state.selectedReasoningEffort,
-                    selectedServiceTier = session.serviceTier
-                        ?.takeIf { tier -> model?.serviceTiers?.any { it.id == tier } == true }
-                        ?: model?.defaultServiceTier,
-                    selectedCollaborationMode = session.collaborationMode
-                        ?.takeIf { mode -> state.collaborationModes.any { it.mode == mode } }
-                        ?: state.defaultCollaborationMode(),
-                    selectedPermissionProfile = session.permissionProfile,
-                    approvalPolicy = session.approvalPolicy ?: state.approvalPolicy,
-                    approvalsReviewer = session.approvalsReviewer ?: state.approvalsReviewer,
-                )
-            }
-            runCatching { client.getThreadGoal(thread.id) }
-                .onSuccess { goal ->
+                    if (error.isCancellation() || !isCurrentRequest()) return@launch
                     _state.update { state ->
                         if (state.selectedThreadId == thread.id) {
                             state.copy(
-                                threadGoal = goal,
                                 isGoalLoading = false,
-                                goalError = null,
+                                isBusy = false,
+                                notice = friendlyError(error),
                             )
                         } else {
                             state
                         }
                     }
+                    return@launch
+                }
+            if (!isCurrentRequest()) return@launch
+            if (!captureSelectedSession()) {
+                _state.update { state ->
+                    if (state.selectedThreadId == thread.id) {
+                        state.copy(isGoalLoading = false, isBusy = false)
+                    } else {
+                        state
+                    }
+                }
+                return@launch
+            }
+            val resumed = sessionRegistry.updateSession(thread.id, markUnread = false) { cached ->
+                val timeline = mergeTimelineHistory(session.timeline, cached.timeline).takeLastWithin(
+                    maxItems = sessionRegistry.limits.maxTimelineItems,
+                    maxChars = sessionRegistry.limits.maxTimelineChars,
+                )
+                val resumedTurnId = resolveResumedTurnId(
+                    remoteActiveTurnId = session.activeTurnId,
+                    cachedIsRunning = cached.isTurnRunning,
+                    cachedActiveTurnId = cached.activeTurnId,
+                    cachedExpectedTurnId = cached.expectedTurnId,
+                )
+                val isRunning = session.activeTurnId != null || cached.isTurnRunning
+                cached.copy(
+                    thread = thread,
+                    timeline = timeline,
+                    approvalQueue = cached.approvalQueue.bindFileChangeSnapshots(timeline, thread.id),
+                    olderHistoryCursor = session.olderHistoryCursor,
+                    hasOlderHistory = session.olderHistoryCursor != null,
+                    isOlderHistoryLoading = false,
+                    olderHistoryError = null,
+                    consumedHistoryCursors = emptySet(),
+                    settings = cached.settings.copy(
+                        model = session.model ?: cached.settings.model,
+                        reasoningEffort = session.reasoningEffort,
+                        serviceTier = session.serviceTier,
+                        collaborationMode = session.collaborationMode ?: cached.settings.collaborationMode,
+                    ).withRemoteAuthorization(
+                        permissionProfile = session.permissionProfile,
+                        approvalPolicy = session.approvalPolicy,
+                        approvalsReviewer = session.approvalsReviewer,
+                    ),
+                    isTurnRunning = isRunning,
+                    activeTurnId = resumedTurnId,
+                    expectedTurnId = resumedTurnId,
+                    streamStatus = if (isRunning) SessionStreamStatus.RUNNING else cached.streamStatus,
+                )
+            }
+            if (!isCurrentRequest()) return@launch
+            if (!applySessionMutation(resumed, "Remote task history exceeded safe cache limits.")) {
+                _state.update { state ->
+                    if (state.selectedThreadId == thread.id) {
+                        state.copy(isGoalLoading = false, isBusy = false)
+                    } else {
+                        state
+                    }
+                }
+                return@launch
+            }
+            _state.update { state ->
+                val projected = state.withSessionRegistry(sessionRegistry)
+                if (projected.selectedThreadId == thread.id) {
+                    projected.copy(
+                        isBusy = false,
+                        approvalFileItems = projected.approvalFileItems.recordFileApprovalItems(
+                            thread.id,
+                            projected.timeline,
+                        ),
+                    )
+                } else {
+                    projected
+                }
+            }
+            runCatching { client.getThreadGoal(thread.id) }
+                .onSuccess { goal ->
+                    if (!isCurrentRequest()) return@onSuccess
+                    if (!captureSelectedSession()) return@onSuccess
+                    val updated = sessionRegistry.updateSession(thread.id, markUnread = false) {
+                        it.copy(goal = goal)
+                    }
+                    if (!applySessionMutation(updated, "Remote goal state could not be cached safely.")) {
+                        return@onSuccess
+                    }
+                    _state.update { state ->
+                        val projected = state.withSessionRegistry(sessionRegistry)
+                        if (projected.selectedThreadId == thread.id) {
+                            projected.copy(
+                                isGoalLoading = false,
+                                goalError = null,
+                            )
+                        } else {
+                            projected
+                        }
+                    }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentRequest()) return@onFailure
+                    if (!captureSelectedSession()) return@onFailure
+                    val updated = sessionRegistry.updateSession(thread.id, markUnread = false) {
+                        it.copy(goal = null)
+                    }
+                    if (!applySessionMutation(updated, "Remote goal state could not be cached safely.")) {
+                        return@onFailure
+                    }
                     _state.update { state ->
-                        if (state.selectedThreadId == thread.id) {
+                        val projected = state.withSessionRegistry(sessionRegistry)
+                        if (projected.selectedThreadId == thread.id) {
                             if (error.isUnsupportedRpcMethod("thread/goal/get")) {
-                                state.copy(
-                                    threadGoal = null,
+                                projected.copy(
                                     isGoalLoading = false,
                                     goalError = null,
                                 )
                             } else {
-                                state.copy(
-                                    threadGoal = null,
+                                projected.copy(
                                     isGoalLoading = false,
                                     goalError = friendlyGoalError(error),
                                 )
                             }
                         } else {
-                            state
+                            projected
                         }
                     }
                 }
@@ -455,6 +1181,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun loadOlderHistory() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val snapshot = _state.value
         val threadId = snapshot.selectedThreadId ?: return
         val cursor = snapshot.olderHistoryCursor ?: return
@@ -467,6 +1194,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     olderHistoryError = "Remote returned a repeated history cursor; stopped loading",
                 )
             }
+            captureSelectedSession()
             return
         }
 
@@ -477,7 +1205,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 state
             }
         }
+        if (!captureSelectedSession()) return
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             val consumedCursors = snapshot.consumedHistoryCursors + cursor
             runCatching {
                 client.loadOlderThreadHistory(threadId, cursor).let { page ->
@@ -489,15 +1219,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }.onSuccess { page ->
-                _state.update { state ->
-                    if (state.selectedThreadId != threadId || state.olderHistoryCursor != cursor) {
-                        return@update state
-                    }
-                    val timeline = mergeTimelineHistory(page.timeline, state.timeline)
-                    state.copy(
+                if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
+                val state = _state.value
+                if (state.selectedThreadId != threadId || state.olderHistoryCursor != cursor) {
+                    return@onSuccess
+                }
+                val updated = sessionRegistry.updateSession(threadId, markUnread = false) { session ->
+                    val timeline = mergeTimelineHistory(page.timeline, session.timeline)
+                    session.copy(
                         timeline = timeline,
-                        approvalQueue = state.approvalQueue.bindFileChangeSnapshots(timeline, threadId),
-                        approvalFileItems = state.approvalFileItems.recordFileApprovalItems(threadId, page.timeline),
+                        approvalQueue = session.approvalQueue.bindFileChangeSnapshots(timeline, threadId),
                         olderHistoryCursor = page.nextCursor,
                         hasOlderHistory = page.nextCursor != null,
                         isOlderHistoryLoading = false,
@@ -505,20 +1236,40 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         consumedHistoryCursors = consumedCursors,
                     )
                 }
+                if (!applySessionMutation(updated, "Remote task history exceeded safe cache limits.")) {
+                    restoreOlderHistoryLoadingAfterRejection(threadId)
+                    return@onSuccess
+                }
+                projectSessionRegistry()
+                _state.update { current ->
+                    current.copy(
+                        approvalFileItems = current.approvalFileItems.recordFileApprovalItems(
+                            threadId,
+                            page.timeline,
+                        ),
+                    )
+                }
             }.onFailure { error ->
+                if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                 val repeatedCursor = error.message.orEmpty().contains("nextCursor", ignoreCase = true)
-                _state.update { state ->
-                    if (state.selectedThreadId != threadId || state.olderHistoryCursor != cursor) {
-                        return@update state
-                    }
-                    state.copy(
-                        olderHistoryCursor = if (repeatedCursor) null else state.olderHistoryCursor,
-                        hasOlderHistory = if (repeatedCursor) false else state.hasOlderHistory,
+                val state = _state.value
+                if (state.selectedThreadId != threadId || state.olderHistoryCursor != cursor) {
+                    return@onFailure
+                }
+                val updated = sessionRegistry.updateSession(threadId, markUnread = false) { session ->
+                    session.copy(
+                        olderHistoryCursor = if (repeatedCursor) null else session.olderHistoryCursor,
+                        hasOlderHistory = if (repeatedCursor) false else session.hasOlderHistory,
                         isOlderHistoryLoading = false,
                         olderHistoryError = friendlyError(error),
                         consumedHistoryCursors = consumedCursors,
                     )
                 }
+                if (!applySessionMutation(updated, "Remote task history state could not be cached safely.")) {
+                    restoreOlderHistoryLoadingAfterRejection(threadId)
+                    return@onFailure
+                }
+                projectSessionRegistry()
             }
         }
     }
@@ -529,10 +1280,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         attachments: List<ComposerImageAttachment> = emptyList(),
         asGoal: Boolean = false,
     ) {
+        if (rejectNewWorkDuringNetworkHandoff()) return
         val prompt = text.trim()
         if (prompt.isEmpty() && attachments.isEmpty()) return
         if (_state.value.activeConnection == null) return
         val client = rpc ?: return
+        val connectionEpoch = sessionRequestTracker.connectionGeneration
+        fun isCurrentOperation(): Boolean =
+            rpc === client && sessionRequestTracker.isCurrentConnection(connectionEpoch)
+        fun requireCurrentOperation() {
+            if (!isCurrentOperation()) throw SupersededConnectionException()
+        }
         val currentState = _state.value
         if (currentState.remoteAccount?.canRunCodex != true) {
             _state.update { it.copy(notice = "Remote Codex is not signed in") }
@@ -573,7 +1331,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             _state.update { it.copy(notice = "Restoring the running task; wait for the remote turn ID before steering") }
             return
         }
+        val draftSelectionToken = if (currentState.selectedThreadId == null) {
+            sessionRequestTracker.captureDraftSelection()
+        } else {
+            null
+        }
+        val draftSelectionContext = currentState.selectionContext()
         viewModelScope.launch {
+            if (!isCurrentOperation()) return@launch
+            var messageThreadId = currentState.selectedThreadId
+            var turnStartToken: TurnStartToken? = null
             val localItemId = "local-${UUID.randomUUID()}"
             val userItem = TimelineItem(
                 id = localItemId,
@@ -596,6 +1363,16 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     notice = null,
                 )
             }
+            if (!captureSelectedSession()) {
+                _state.update { state ->
+                    state.copy(
+                        timeline = state.timeline.filterNot { it.id == localItemId },
+                        isTurnRunning = if (asGoal) state.isTurnRunning else false,
+                        isGoalLoading = if (asGoal) false else state.isGoalLoading,
+                    )
+                }
+                return@launch
+            }
             runCatching {
                 if (steeringThreadId != null && steeringTurnId != null) {
                     client.steerTurn(
@@ -605,9 +1382,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         mentions = mentions,
                         attachments = attachments,
                     )
+                    requireCurrentOperation()
                     return@runCatching
                 }
-                val threadId = _state.value.selectedThreadId ?: client.startThread(
+                val threadId = currentState.selectedThreadId ?: client.startThread(
                     cwd = cwd,
                     model = selectedModel,
                     serviceTier = selectedServiceTier,
@@ -615,34 +1393,87 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     approvalsReviewer = approvalsReviewer,
                     permissionProfile = permissionProfile,
                 ).let { started ->
-                    _state.update {
-                        it.copy(
-                            selectedThreadId = started.id,
-                            selectedModel = started.model ?: it.selectedModel,
-                            selectedReasoningEffort = selectedReasoningEffort
-                                ?: started.reasoningEffort
-                                ?: it.selectedReasoningEffort,
-                            selectedServiceTier = started.serviceTier ?: it.selectedServiceTier,
+                    requireCurrentOperation()
+                    val registered = sessionRegistry.registerThread(started.id)
+                    if (!registered.applied) {
+                        sessionRegistry = registered.registry
+                        error("New remote task could not be cached safely")
+                    }
+                    sessionRegistry = registered.registry
+                    val initialized = sessionRegistry.updateSession(started.id, markUnread = false) { session ->
+                        session.copy(
+                            timeline = listOf(userItem),
+                            isTurnRunning = !asGoal,
+                            streamStatus = if (asGoal) SessionStreamStatus.IDLE else SessionStreamStatus.RUNNING,
+                            settings = SessionSettings(
+                                model = started.model ?: selectedModel,
+                                reasoningEffort = selectedReasoningEffort ?: started.reasoningEffort,
+                                serviceTier = started.serviceTier ?: selectedServiceTier,
+                                collaborationMode = collaborationMode?.mode ?: currentState.selectedCollaborationMode,
+                                permissionProfile = permissionProfile,
+                                approvalPolicy = approvalPolicy,
+                                approvalsReviewer = approvalsReviewer,
+                            ),
                         )
                     }
+                    if (!applySessionMutation(initialized, "New remote task exceeded safe cache limits.")) {
+                        error("New remote task could not be initialized safely")
+                    }
+                    val shouldSelectStarted = draftSelectionToken != null &&
+                        sessionRequestTracker.isCurrent(draftSelectionToken) &&
+                        _state.value.matchesSelection(draftSelectionContext)
+                    if (shouldSelectStarted) {
+                        sessionRequestTracker.advanceSelection()
+                        val selected = sessionRegistry.selectThread(
+                            threadId = started.id,
+                            knownThreadIds = knownSessionThreadIds() + started.id,
+                        )
+                        if (!applySessionMutation(selected, "New remote task could not be selected safely.")) {
+                            error("New remote task could not be selected safely")
+                        }
+                        _state.update { state ->
+                            state.copy(
+                                selectedProjectPath = cwd,
+                                selectedThreadId = started.id,
+                                selectedModel = started.model ?: state.selectedModel,
+                                selectedReasoningEffort = selectedReasoningEffort
+                                    ?: started.reasoningEffort
+                                    ?: state.selectedReasoningEffort,
+                                selectedServiceTier = started.serviceTier ?: state.selectedServiceTier,
+                            )
+                        }
+                    }
+                    projectSessionRegistry()
                     started.id
                 }
+                messageThreadId = threadId
                 if (asGoal) {
                     val goal = client.setThreadGoal(
                         threadId = threadId,
                         objective = prompt,
                         status = ThreadGoalStatus.ACTIVE,
                     )
+                    requireCurrentOperation()
+                    if (!captureSelectedSession()) error("Remote goal state could not be cached safely")
+                    val updated = sessionRegistry.updateSession(threadId, markUnread = false) {
+                        it.copy(goal = goal)
+                    }
+                    if (!applySessionMutation(updated, "Remote goal state could not be cached safely.")) {
+                        error("Remote goal state could not be cached safely")
+                    }
                     _state.update { state ->
-                        if (state.selectedThreadId == threadId) {
-                            state.copy(threadGoal = goal, isGoalLoading = false, goalError = null)
+                        val projected = state.withSessionRegistry(sessionRegistry)
+                        if (projected.selectedThreadId == threadId) {
+                            projected.copy(isGoalLoading = false, goalError = null)
                         } else {
-                            state
+                            projected
                         }
                     }
                     return@runCatching
                 }
-                client.startTurn(
+                val startToken = sessionRequestTracker.beginTurnStart(threadId)
+                turnStartToken = startToken
+                val startedTurnId = client.startTurn(
                     threadId = threadId,
                     text = prompt,
                     cwd = cwd,
@@ -656,19 +1487,82 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     mentions = mentions,
                     attachments = attachments,
                 )
+                requireCurrentOperation()
+                if (startedTurnId != null) {
+                    when (sessionRequestTracker.resolveTurnStartResponse(startToken, startedTurnId)) {
+                        TurnStartResponseDisposition.APPLY -> routeSessionEvent(
+                            client,
+                            connectionEpoch,
+                            AppServerEvent.TurnRunning(threadId, running = true, turnId = startedTurnId),
+                        )
+                        TurnStartResponseDisposition.ALREADY_OBSERVED,
+                        TurnStartResponseDisposition.TERMINAL,
+                        TurnStartResponseDisposition.SUPERSEDED,
+                        -> Unit
+                        TurnStartResponseDisposition.CONFLICT -> failClosedTurnIdentity(
+                            client,
+                            connectionEpoch,
+                            "Remote returned a conflicting turn ID; disconnected to preserve task ownership.",
+                        )
+                    }
+                }
             }.onSuccess {
+                if (!isCurrentOperation()) return@onSuccess
                 if (steeringThreadId != null) {
                     _state.update { it.copy(notice = "Message added to the running task") }
                 }
             }.onFailure { error ->
-                _state.update {
-                    it.copy(
-                        timeline = it.timeline.filterNot { item -> item.id == localItemId },
-                        isTurnRunning = if (asGoal) it.isTurnRunning else steeringThreadId != null,
-                        activeTurnId = if (asGoal || steeringThreadId != null) it.activeTurnId else null,
-                        isGoalLoading = if (asGoal) false else it.isGoalLoading,
-                        goalError = if (asGoal) friendlyGoalError(error) else it.goalError,
-                    )
+                if (error.isCancellation() || !isCurrentOperation()) return@onFailure
+                val ownsRollback = turnStartToken?.let(sessionRequestTracker::canRollbackTurnStart) ?: true
+                if (!ownsRollback) return@onFailure
+                if (messageThreadId == null && draftSelectionToken != null &&
+                    (!sessionRequestTracker.isCurrent(draftSelectionToken) ||
+                        !_state.value.matchesSelection(draftSelectionContext))
+                ) {
+                    return@onFailure
+                }
+                if (!captureSelectedSession()) return@onFailure
+                val failedThreadId = messageThreadId
+                if (failedThreadId != null && failedThreadId in sessionRegistry.sessions) {
+                    val failed = sessionRegistry.updateSession(failedThreadId, markUnread = false) { session ->
+                        session.copy(
+                            timeline = session.timeline.filterNot { item -> item.id == localItemId },
+                            isTurnRunning = if (asGoal || steeringThreadId != null) {
+                                session.isTurnRunning
+                            } else {
+                                false
+                            },
+                            activeTurnId = if (asGoal || steeringThreadId != null) session.activeTurnId else null,
+                            expectedTurnId = if (asGoal || steeringThreadId != null) session.expectedTurnId else null,
+                            streamStatus = if (asGoal || steeringThreadId != null) {
+                                session.streamStatus
+                            } else {
+                                SessionStreamStatus.FAILED
+                            },
+                        )
+                    }
+                    if (!applySessionMutation(failed, "Failed task state could not be cached safely.")) {
+                        return@onFailure
+                    }
+                }
+                _state.update { state ->
+                    val projected = state.withSessionRegistry(sessionRegistry)
+                    if (failedThreadId == null && projected.selectedThreadId == null) {
+                        projected.copy(
+                            timeline = projected.timeline.filterNot { item -> item.id == localItemId },
+                            isTurnRunning = if (asGoal) projected.isTurnRunning else false,
+                            activeTurnId = if (asGoal) projected.activeTurnId else null,
+                            isGoalLoading = if (asGoal) false else projected.isGoalLoading,
+                            goalError = if (asGoal) friendlyGoalError(error) else projected.goalError,
+                        )
+                    } else if (projected.selectedThreadId == failedThreadId) {
+                        projected.copy(
+                            isGoalLoading = if (asGoal) false else projected.isGoalLoading,
+                            goalError = if (asGoal) friendlyGoalError(error) else projected.goalError,
+                        )
+                    } else {
+                        projected
+                    }
                 }
                 if (asGoal) {
                     _state.update {
@@ -685,22 +1579,33 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val trimmedName = name.trim()
         if (trimmedName.isEmpty()) return
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.renameThread(thread.id, trimmedName) }
-                .onSuccess { _state.update { it.withThreadRenamed(thread.id, trimmedName) } }
-                .onFailure(::showError)
+                .onSuccess {
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
+                    _state.update { it.withThreadRenamed(thread.id, trimmedName) }
+                }
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+                }
         }
     }
 
     fun archiveThread(thread: RemoteThread) {
         val client = rpc ?: return
-        if (_state.value.isTurnRunning && _state.value.selectedThreadId == thread.id) {
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
+        if (!captureSelectedSession()) return
+        if (shouldBlockArchive(thread, sessionRegistry.sessions[thread.id])) {
             _state.update { it.copy(notice = "Stop the current task before archiving it") }
             return
         }
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.archiveThread(thread.id) }
                 .onSuccess {
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update { state ->
                         state.withThreadArchived(thread.id).copy(
                             archivedThreads = (listOf(thread) + state.archivedThreads)
@@ -708,17 +1613,34 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 .sortedByDescending { it.updatedAt },
                         )
                     }
+                    if (sessionRegistry.selectedThreadId == thread.id) {
+                        sessionRequestTracker.advanceSelection()
+                        sessionRegistry = sessionRegistry.clearSelection()
+                        _state.update { state ->
+                            state.copy(
+                                selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                                approvalPolicy = SAFE_APPROVAL_POLICY,
+                                approvalsReviewer = SAFE_APPROVALS_REVIEWER,
+                            )
+                        }
+                        projectSessionRegistry()
+                    }
                 }
-                .onFailure(::showError)
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+                }
         }
     }
 
     fun loadArchivedThreads() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isArchivedThreadsLoading = true, archivedThreadsError = null) }
             runCatching { client.listArchivedThreads() }
                 .onSuccess { archived ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update {
                         it.copy(
                             archivedThreads = archived,
@@ -728,6 +1650,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     _state.update {
                         it.copy(
                             isArchivedThreadsLoading = false,
@@ -740,9 +1663,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun unarchiveThread(thread: RemoteThread) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.unarchiveThread(thread.id) }
                 .onSuccess { restored ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update { state ->
                         val threads = (listOf(restored) + state.threads).distinctBy { it.id }
                         state.copy(
@@ -753,15 +1679,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 }
-                .onFailure(::showError)
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+                }
         }
     }
 
     fun deleteArchivedThread(thread: RemoteThread) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.deleteThread(thread.id) }
                 .onSuccess {
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update { state ->
                         state.copy(
                             archivedThreads = state.archivedThreads.filterNot { it.id == thread.id },
@@ -769,15 +1700,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 }
-                .onFailure(::showError)
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+                }
         }
     }
 
     fun setThreadPinned(thread: RemoteThread, isPinned: Boolean) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.setThreadPinned(thread.id, isPinned) }
                 .onSuccess { updated ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update { state ->
                         val threads = state.threads.map { current ->
                             if (current.id == updated.id) updated else current
@@ -785,12 +1721,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         state.copy(threads = threads, projects = groupThreadsByProject(threads))
                     }
                 }
-                .onFailure(::showError)
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+                }
         }
     }
 
     fun compactThread() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId ?: run {
             _state.update { it.copy(notice = "This new task has no context to compact") }
             return
@@ -800,14 +1739,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.compactThread(threadId) }
-                .onSuccess { _state.update { it.copy(notice = "Compacting task context") } }
-                .onFailure(::showError)
+                .onSuccess {
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
+                    _state.update { it.copy(notice = "Compacting task context") }
+                }
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+                }
         }
     }
 
     fun forkThread() {
+        if (rejectNewWorkDuringNetworkHandoff()) return
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val snapshot = _state.value
         val threadId = snapshot.selectedThreadId ?: run {
             _state.update { it.copy(notice = "Open a remote task before continuing to a new one") }
@@ -820,6 +1767,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val cwd = snapshot.threads.firstOrNull { it.id == threadId }?.cwd
             ?.takeIf(String::isNotBlank) ?: snapshot.selectedProjectPath.orEmpty()
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isBusy = true, notice = null) }
             runCatching {
                 client.forkThread(
@@ -832,51 +1780,93 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     permissionProfile = snapshot.selectedPermissionProfile,
                 )
             }.onSuccess { forked ->
-                _state.update { state ->
-                    val threads = (listOf(forked.thread) + state.threads).distinctBy { it.id }
-                    val model = state.models.firstOrNull { it.id == forked.session.model }
-                    val timeline = forked.session.timeline
-                    state.copy(
-                        threads = threads,
-                        projects = groupThreadsByProject(threads),
-                        selectedProjectPath = forked.thread.cwd.ifBlank { state.selectedProjectPath.orEmpty() },
-                        selectedThreadId = forked.thread.id,
-                        threadGoal = null,
-                        isGoalLoading = false,
-                        goalError = null,
-                        threadTokenUsage = null,
-                        timeline = timeline,
-                        approvalQueue = state.approvalQueue.bindFileChangeSnapshots(timeline, forked.thread.id),
-                        approvalFileItems = state.approvalFileItems.recordFileApprovalItems(forked.thread.id, timeline),
+                if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
+                if (!captureSelectedSession()) return@onSuccess
+                val shouldSelectFork = _state.value.selectedThreadId == threadId
+                val registered = sessionRegistry.registerThread(forked.thread)
+                if (!registered.applied) {
+                    sessionRegistry = registered.registry
+                    _state.update { it.copy(isBusy = false, notice = "The continued task could not be cached safely") }
+                    return@onSuccess
+                }
+                sessionRegistry = registered.registry
+                val initialized = sessionRegistry.updateSession(forked.thread.id, markUnread = false) { session ->
+                    session.copy(
+                        thread = forked.thread,
+                        timeline = forked.session.timeline,
                         olderHistoryCursor = forked.session.olderHistoryCursor,
                         hasOlderHistory = forked.session.olderHistoryCursor != null,
-                        isOlderHistoryLoading = false,
-                        olderHistoryError = null,
-                        consumedHistoryCursors = emptySet(),
-                        selectedModel = model?.id ?: state.selectedModel,
-                        selectedReasoningEffort = forked.session.reasoningEffort
-                            ?.takeIf { effort -> model?.supports(effort) == true }
-                            ?: model?.preferredReasoningEffort()
-                            ?: state.selectedReasoningEffort,
-                        selectedServiceTier = forked.session.serviceTier
-                            ?.takeIf { tier -> model?.serviceTiers?.any { it.id == tier } == true }
-                            ?: model?.defaultServiceTier,
-                        selectedCollaborationMode = forked.session.collaborationMode
-                            ?.takeIf { mode -> state.collaborationModes.any { it.mode == mode } }
-                            ?: state.defaultCollaborationMode(),
-                        selectedPermissionProfile = forked.session.permissionProfile,
-                        approvalPolicy = forked.session.approvalPolicy ?: state.approvalPolicy,
-                        approvalsReviewer = forked.session.approvalsReviewer ?: state.approvalsReviewer,
-                        isBusy = false,
-                        notice = "Continued in a new remote task",
+                        goal = null,
+                        tokenUsage = null,
+                        isTurnRunning = forked.session.activeTurnId != null,
+                        activeTurnId = forked.session.activeTurnId,
+                        expectedTurnId = forked.session.activeTurnId,
+                        streamStatus = if (forked.session.activeTurnId != null) {
+                            SessionStreamStatus.RUNNING
+                        } else {
+                            SessionStreamStatus.IDLE
+                        },
+                        settings = SessionSettings(
+                            model = forked.session.model ?: snapshot.selectedModel,
+                            reasoningEffort = forked.session.reasoningEffort,
+                            serviceTier = forked.session.serviceTier,
+                            collaborationMode = forked.session.collaborationMode
+                                ?: snapshot.defaultCollaborationMode(),
+                        ).withRemoteAuthorization(
+                            permissionProfile = forked.session.permissionProfile,
+                            approvalPolicy = forked.session.approvalPolicy,
+                            approvalsReviewer = forked.session.approvalsReviewer,
+                        ),
                     )
                 }
-            }.onFailure(::showError)
+                if (!applySessionMutation(initialized, "The continued task exceeded safe cache limits.")) {
+                    return@onSuccess
+                }
+                if (shouldSelectFork) {
+                    val selected = sessionRegistry.selectThread(forked.thread)
+                    if (!applySessionMutation(selected, "The continued task could not be selected safely.")) {
+                        return@onSuccess
+                    }
+                }
+                _state.update { state ->
+                    val threads = (listOf(forked.thread) + state.threads).distinctBy { it.id }
+                    val updated = state.copy(
+                        threads = threads,
+                        projects = groupThreadsByProject(threads),
+                        isBusy = false,
+                        notice = if (shouldSelectFork) {
+                            "Continued in a new remote task"
+                        } else {
+                            "New continued task is ready in the task list"
+                        },
+                    )
+                    val projected = updated.withSessionRegistry(sessionRegistry)
+                    if (shouldSelectFork) {
+                        projected.copy(
+                            selectedProjectPath = forked.thread.cwd.ifBlank {
+                                projected.selectedProjectPath.orEmpty()
+                            },
+                            isGoalLoading = false,
+                            goalError = null,
+                            approvalFileItems = projected.approvalFileItems.recordFileApprovalItems(
+                                forked.thread.id,
+                                projected.timeline,
+                            ),
+                        )
+                    } else {
+                        projected
+                    }
+                }
+            }.onFailure { error ->
+                if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+            }
         }
     }
 
     fun startReview(targetKind: ReviewTargetKind, targetValue: String = "") {
+        if (rejectNewWorkDuringNetworkHandoff()) return
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val snapshot = _state.value
         val threadId = snapshot.selectedThreadId ?: run {
             _state.update { it.copy(notice = "Open a remote task before starting code review") }
@@ -891,18 +1881,59 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isTurnRunning = true, notice = null) }
+            if (!captureSelectedSession()) {
+                _state.update { it.copy(isTurnRunning = false) }
+                return@launch
+            }
+            val startToken = sessionRequestTracker.beginTurnStart(threadId)
             runCatching { client.startReview(threadId, targetKind, targetValue) }
                 .onSuccess { review ->
-                    _state.update {
-                        it.copy(
-                            isTurnRunning = true,
-                            activeTurnId = review.turnId,
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
+                    if (review.threadId != threadId) {
+                        failClosedTurnIdentity(
+                            client,
+                            connectionGeneration,
+                            "Remote review response changed task ownership; disconnected safely.",
+                        )
+                        return@onSuccess
+                    }
+                    when (sessionRequestTracker.resolveTurnStartResponse(startToken, review.turnId)) {
+                        TurnStartResponseDisposition.APPLY -> routeSessionEvent(
+                            client,
+                            connectionGeneration,
+                            AppServerEvent.TurnRunning(threadId, running = true, turnId = review.turnId),
+                        )
+                        TurnStartResponseDisposition.ALREADY_OBSERVED,
+                        TurnStartResponseDisposition.TERMINAL,
+                        TurnStartResponseDisposition.SUPERSEDED,
+                        -> Unit
+                        TurnStartResponseDisposition.CONFLICT -> failClosedTurnIdentity(
+                            client,
+                            connectionGeneration,
+                            "Remote review response returned a conflicting turn ID; disconnected safely.",
                         )
                     }
                 }
                 .onFailure { error ->
-                    _state.update { it.copy(isTurnRunning = false, activeTurnId = null) }
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration) ||
+                        !sessionRequestTracker.canRollbackTurnStart(startToken)
+                    ) {
+                        return@onFailure
+                    }
+                    val failed = sessionRegistry.updateSession(threadId, markUnread = false) { session ->
+                        session.copy(
+                            isTurnRunning = false,
+                            activeTurnId = null,
+                            expectedTurnId = null,
+                            streamStatus = SessionStreamStatus.FAILED,
+                        )
+                    }
+                    if (!applySessionMutation(failed, "Failed review state could not be cached safely.")) {
+                        return@onFailure
+                    }
+                    projectSessionRegistry()
                     showError(error)
                 }
         }
@@ -910,7 +1941,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun runInit() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val snapshot = _state.value
+        val selectionToken = sessionRequestTracker.captureDraftSelection()
+        val selectionContext = snapshot.selectionContext()
         if (snapshot.isTurnRunning) {
             _state.update { it.copy(notice = "Cannot run /init while the current task is running") }
             return
@@ -923,31 +1957,49 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             val agentsPath = remoteChildPath(cwd, "AGENTS.md")
             runCatching { client.remotePathExists(agentsPath) }
                 .onSuccess { exists ->
+                    if (!isCurrentConnection(client, connectionGeneration) ||
+                        !sessionRequestTracker.isCurrent(selectionToken) ||
+                        !_state.value.matchesSelection(selectionContext)
+                    ) {
+                        return@onSuccess
+                    }
                     if (exists) {
                         _state.update { it.copy(notice = "AGENTS.md already exists; skipped /init to avoid overwriting it") }
                     } else {
                         sendMessage(INIT_PROMPT)
                     }
                 }
-                .onFailure(::showError)
+                .onFailure { error ->
+                    if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration) &&
+                        sessionRequestTracker.isCurrent(selectionToken) &&
+                        _state.value.matchesSelection(selectionContext)
+                    ) {
+                        showError(error)
+                    }
+                }
         }
     }
 
     fun loadMcpStatus() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isMcpStatusLoading = true, mcpStatusError = null) }
             runCatching { client.listMcpServerStatuses(threadId) }
                 .onSuccess { servers ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update {
                         it.copy(mcpServers = servers, isMcpStatusLoading = false, mcpStatusError = null)
                     }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     _state.update {
                         it.copy(
                             mcpServers = emptyList(),
@@ -961,17 +2013,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun reloadMcpServers() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isMcpStatusLoading = true, mcpStatusError = null) }
             runCatching {
                 client.reloadMcpServers()
                 client.listMcpServerStatuses(threadId)
             }.onSuccess { servers ->
+                if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                 _state.update {
                     it.copy(mcpServers = servers, isMcpStatusLoading = false, mcpStatusError = null)
                 }
             }.onFailure { error ->
+                if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                 _state.update {
                     it.copy(isMcpStatusLoading = false, mcpStatusError = friendlyError(error))
                 }
@@ -981,11 +2037,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startMcpLogin(serverName: String) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isMcpLoginStarting = true, mcpStatusError = null) }
             runCatching { client.startMcpOauthLogin(serverName, threadId) }
                 .onSuccess { authorizationUrl ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update {
                         it.copy(
                             isMcpLoginStarting = false,
@@ -995,6 +2054,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     _state.update {
                         it.copy(isMcpLoginStarting = false, mcpStatusError = friendlyError(error))
                     }
@@ -1006,11 +2066,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun submitFeedback(classification: String, reason: String) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isFeedbackSubmitting = true, feedbackError = null) }
             runCatching { client.submitFeedback(classification, reason, threadId) }
                 .onSuccess { feedbackId ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update {
                         it.copy(
                             isFeedbackSubmitting = false,
@@ -1024,6 +2087,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     val message = friendlyError(error)
                     _state.update {
                         it.copy(isFeedbackSubmitting = false, feedbackError = message, notice = message)
@@ -1043,11 +2107,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val client = rpc ?: return
+        val connectionEpoch = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId ?: run {
             showGoalRequirement()
             return
         }
         viewModelScope.launch {
+            if (rpc !== client || !sessionRequestTracker.isCurrentConnection(connectionEpoch)) return@launch
             _state.update { it.copy(isGoalLoading = true, goalError = null) }
             runCatching {
                 client.setThreadGoal(
@@ -1056,14 +2122,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     status = ThreadGoalStatus.ACTIVE,
                 )
             }.onSuccess { goal ->
-                _state.update { state ->
-                    if (state.selectedThreadId == threadId) {
-                        state.copy(threadGoal = goal, isGoalLoading = false, goalError = null)
-                    } else {
-                        state
-                    }
-                }
+                if (rpc !== client || !sessionRequestTracker.isCurrentConnection(connectionEpoch)) return@onSuccess
+                applyGoalResult(threadId, goal)
             }.onFailure { error ->
+                if (error.isCancellation() || rpc !== client ||
+                    !sessionRequestTracker.isCurrentConnection(connectionEpoch)
+                ) return@onFailure
                 updateGoalFailure(threadId, "Failed to set goal", error)
             }
         }
@@ -1071,23 +2135,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setThreadGoalStatus(status: ThreadGoalStatus) {
         val client = rpc ?: return
+        val connectionEpoch = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId ?: run {
             showGoalRequirement()
             return
         }
         viewModelScope.launch {
+            if (rpc !== client || !sessionRequestTracker.isCurrentConnection(connectionEpoch)) return@launch
             _state.update { it.copy(isGoalLoading = true, goalError = null) }
             runCatching { client.setThreadGoal(threadId = threadId, status = status) }
                 .onSuccess { goal ->
-                    _state.update { state ->
-                        if (state.selectedThreadId == threadId) {
-                            state.copy(threadGoal = goal, isGoalLoading = false, goalError = null)
-                        } else {
-                            state
-                        }
-                    }
+                    if (rpc !== client || !sessionRequestTracker.isCurrentConnection(connectionEpoch)) return@onSuccess
+                    applyGoalResult(threadId, goal)
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || rpc !== client ||
+                        !sessionRequestTracker.isCurrentConnection(connectionEpoch)
+                    ) return@onFailure
                     updateGoalFailure(threadId, "Failed to update goal", error)
                 }
         }
@@ -1095,20 +2159,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearThreadGoal() {
         val client = rpc ?: return
+        val connectionEpoch = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId ?: return
         viewModelScope.launch {
+            if (rpc !== client || !sessionRequestTracker.isCurrentConnection(connectionEpoch)) return@launch
             _state.update { it.copy(isGoalLoading = true, goalError = null) }
             runCatching { client.clearThreadGoal(threadId) }
                 .onSuccess {
-                    _state.update { state ->
-                        if (state.selectedThreadId == threadId) {
-                            state.copy(threadGoal = null, isGoalLoading = false, goalError = null)
-                        } else {
-                            state
-                        }
-                    }
+                    if (rpc !== client || !sessionRequestTracker.isCurrentConnection(connectionEpoch)) return@onSuccess
+                    applyGoalResult(threadId, null)
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || rpc !== client ||
+                        !sessionRequestTracker.isCurrentConnection(connectionEpoch)
+                    ) return@onFailure
                     updateGoalFailure(threadId, "Failed to clear goal", error)
                 }
         }
@@ -1116,15 +2180,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun showConnectionStatus() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isStatusLoading = true, statusError = null) }
             runCatching { client.readRateLimits() }
                 .onSuccess { limits ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update {
                         it.copy(rateLimits = limits, isStatusLoading = false, statusError = null)
                     }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     _state.update { state ->
                         if (error.isUnsupportedRpcMethod("account/rateLimits/read")) {
                             state.copy(rateLimits = null, isStatusLoading = false, statusError = null)
@@ -1138,10 +2206,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun interruptTurn() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val threadId = _state.value.selectedThreadId ?: return
         val turnId = _state.value.activeTurnId ?: return
         viewModelScope.launch {
-            runCatching { client.interruptTurn(threadId, turnId) }.onFailure(::showError)
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
+            runCatching { client.interruptTurn(threadId, turnId) }.onFailure { error ->
+                if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+            }
         }
     }
 
@@ -1151,19 +2223,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         answers: Map<String, List<String>> = emptyMap(),
     ) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val approval = beginApprovalResponse(requestKey, decision) ?: return
         viewModelScope.launch(start = CoroutineStart.UNDISPATCHED) {
             approvalFlowMutex.withLock {
-                runCatching { client.respondToApproval(approval, decision, answers) }
-                    .onSuccess {
-                        if (rpc === client) {
-                            _state.update { state ->
-                                state.copy(approvalQueue = state.approvalQueue.complete(requestKey))
-                            }
-                        }
-                    }
-                    .onFailure {
-                        if (rpc === client) {
+                if (!isCurrentConnection(client, connectionGeneration)) return@withLock
+                runCatching { client.respondToApproval(approval.request, decision, answers) }
+                    .onFailure { error ->
+                        if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) {
                             disconnectInternal(clearActive = false)
                             _state.update { state ->
                                 state.copy(
@@ -1177,37 +2244,52 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun beginApprovalResponse(requestKey: ApprovalQueueKey, decision: String): ApprovalRequest? {
-        while (true) {
-            val state = _state.value
-            val approval = state.approvalQueue.currentEntry
-                ?.takeIf { it.key == requestKey }
-                ?.takeUnless { requestKey in state.approvalQueue.respondingKeys }
-                ?.request
-                ?: return null
-            if (!approval.supportsDecision(decision)) {
-                _state.update { it.copy(notice = "This approval decision is not available.") }
+    private fun beginApprovalResponse(requestKey: ApprovalQueueKey, decision: String): OwnedApproval? {
+        if (!captureSelectedSession()) return null
+        val approval = sessionRegistry.currentApproval
+            ?.takeIf { it.key.queueKey == requestKey }
+            ?.takeUnless(OwnedApproval::responding)
+            ?: return null
+        if (!approval.request.supportsDecision(decision)) {
+            _state.update { it.copy(notice = "This approval decision is not available.") }
+            return null
+        }
+        val owner = sessionRegistry.sessions[approval.key.threadId] ?: return null
+        if (!approvalBelongsToLiveTurn(owner, approval.request)) {
+            _state.update { it.copy(notice = "This approval's turn is no longer active; no response was sent.") }
+            return null
+        }
+        if (decision.startsWith("accept")) {
+            if (sessionRegistry.selectedThreadId != approval.key.threadId) {
+                _state.update { it.copy(notice = "Open the owning task before allowing this action.") }
                 return null
             }
-            if (decision.startsWith("accept") && !approval.canApprove(state.timeline, state.selectedThreadId)) {
+            if (!approval.request.canApprove(owner.timeline, approval.key.threadId)) {
                 _state.update { it.copy(notice = "Approval details are incomplete; only denial is allowed.") }
                 return null
             }
-            val responding = state.copy(approvalQueue = state.approvalQueue.markResponding(requestKey))
-            if (_state.compareAndSet(state, responding)) return approval
         }
+        val responding = sessionRegistry.markApprovalResponding(approval.key)
+        if (!responding.applied) return null
+        sessionRegistry = responding.registry
+        projectSessionRegistry()
+        return sessionRegistry.approvalFor(approval.key)
     }
 
     fun startRemoteLogin() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         if (_state.value.isLoginStarting || _state.value.remoteDeviceLogin != null) return
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update { it.copy(isLoginStarting = true, notice = null) }
             runCatching { client.startDeviceLogin() }
                 .onSuccess { login ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update { it.copy(remoteDeviceLogin = login, isLoginStarting = false) }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     _state.update { it.copy(isLoginStarting = false) }
                     showError(error)
                 }
@@ -1217,82 +2299,105 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun cancelRemoteLogin() {
         val login = _state.value.remoteDeviceLogin ?: return
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         _state.update { it.copy(remoteDeviceLogin = null, isLoginStarting = false) }
         viewModelScope.launch {
-            runCatching { client.cancelLogin(login.loginId) }.onFailure(::showError)
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
+            runCatching { client.cancelLogin(login.loginId) }.onFailure { error ->
+                if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+            }
         }
     }
 
-    fun setModel(modelId: String) = _state.update { state ->
-        val model = state.models.firstOrNull { it.id == modelId } ?: return@update state
-        state.copy(
-            selectedModel = model.id,
-            selectedReasoningEffort = model.preferredReasoningEffort(),
-            selectedServiceTier = model.defaultServiceTier,
-        )
-    }
-
-    fun setReasoningEffort(effort: String) = _state.update { state ->
-        val model = state.models.firstOrNull { it.id == state.selectedModel }
-        if (model?.supports(effort) == true) state.copy(selectedReasoningEffort = effort) else state
-    }
-
-    fun setServiceTier(serviceTier: String?) = _state.update { state ->
-        val model = state.models.firstOrNull { it.id == state.selectedModel } ?: return@update state
-        if (serviceTier == null || model.serviceTiers.any { it.id == serviceTier }) {
-            state.copy(selectedServiceTier = serviceTier)
-        } else {
-            state
-        }
-    }
-
-    fun setCollaborationMode(mode: String) = _state.update { state ->
-        if (state.collaborationModes.any { it.mode == mode }) {
+    fun setModel(modelId: String) {
+        _state.update { state ->
+            val model = state.models.firstOrNull { it.id == modelId } ?: return@update state
             state.copy(
-                selectedCollaborationMode = mode,
-                notice = if (mode == "plan") "Switched to plan mode" else null,
+                selectedModel = model.id,
+                selectedReasoningEffort = model.preferredReasoningEffort(),
+                selectedServiceTier = model.defaultServiceTier,
             )
-        } else {
-            state.copy(notice = "Remote Codex does not provide $mode mode")
         }
+        captureSelectedSession()
     }
 
-    fun setPermissionProfile(profileId: String?) = _state.update { state ->
-        if (profileId == null || profileId in BUILT_IN_PERMISSION_PROFILES ||
-            state.permissionProfiles.any { it.id == profileId && it.allowed }
-        ) {
-            state.copy(selectedPermissionProfile = profileId)
-        } else {
-            state
+    fun setReasoningEffort(effort: String) {
+        _state.update { state ->
+            val model = state.models.firstOrNull { it.id == state.selectedModel }
+            if (model?.supports(effort) == true) state.copy(selectedReasoningEffort = effort) else state
         }
+        if (!captureSelectedSession()) return
     }
 
-    fun setPermissionMode(mode: PermissionMode) = _state.update { state ->
-        when (mode) {
-            PermissionMode.ASK -> state.copy(
-                selectedPermissionProfile = ":workspace",
-                approvalPolicy = "on-request",
-                approvalsReviewer = "user",
-            )
-            PermissionMode.AUTO_REVIEW -> state.copy(
-                selectedPermissionProfile = ":workspace",
-                approvalPolicy = "on-request",
-                approvalsReviewer = "auto_review",
-            )
-            PermissionMode.FULL_ACCESS -> state.copy(
-                selectedPermissionProfile = ":danger-full-access",
-                approvalPolicy = "never",
-                approvalsReviewer = "user",
-            )
-            PermissionMode.READ_ONLY -> state.copy(
-                selectedPermissionProfile = ":read-only",
-                approvalPolicy = "on-request",
-                approvalsReviewer = "user",
-            )
+    fun setServiceTier(serviceTier: String?) {
+        _state.update { state ->
+            val model = state.models.firstOrNull { it.id == state.selectedModel } ?: return@update state
+            if (serviceTier == null || model.serviceTiers.any { it.id == serviceTier }) {
+                state.copy(selectedServiceTier = serviceTier)
+            } else {
+                state
+            }
         }
+        captureSelectedSession()
+    }
+
+    fun setCollaborationMode(mode: String) {
+        _state.update { state ->
+            if (state.collaborationModes.any { it.mode == mode }) {
+                state.copy(
+                    selectedCollaborationMode = mode,
+                    notice = if (mode == "plan") "Switched to plan mode" else null,
+                )
+            } else {
+                state.copy(notice = "Remote Codex does not provide $mode mode")
+            }
+        }
+        if (!captureSelectedSession()) return
+    }
+
+    fun setPermissionProfile(profileId: String?) {
+        _state.update { state ->
+            if (profileId == null || profileId in BUILT_IN_PERMISSION_PROFILES ||
+                state.permissionProfiles.any { it.id == profileId && it.allowed }
+            ) {
+                state.copy(selectedPermissionProfile = profileId)
+            } else {
+                state
+            }
+        }
+        captureSelectedSession()
+    }
+
+    fun setPermissionMode(mode: PermissionMode) {
+        _state.update { state ->
+            when (mode) {
+                PermissionMode.ASK -> state.copy(
+                    selectedPermissionProfile = ":workspace",
+                    approvalPolicy = "on-request",
+                    approvalsReviewer = "user",
+                )
+                PermissionMode.AUTO_REVIEW -> state.copy(
+                    selectedPermissionProfile = ":workspace",
+                    approvalPolicy = "on-request",
+                    approvalsReviewer = "auto_review",
+                )
+                PermissionMode.FULL_ACCESS -> state.copy(
+                    selectedPermissionProfile = ":danger-full-access",
+                    approvalPolicy = "never",
+                    approvalsReviewer = "user",
+                )
+                PermissionMode.READ_ONLY -> state.copy(
+                    selectedPermissionProfile = ":read-only",
+                    approvalPolicy = "on-request",
+                    approvalsReviewer = "user",
+                )
+            }
+        }
+        if (!captureSelectedSession()) return
     }
     fun loadRemoteDirectory(path: String) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         if (path.isBlank()) return
         _state.update {
             it.copy(
@@ -1303,8 +2408,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching { client.readRemoteDirectory(path) }
                 .onSuccess { entries ->
+                    if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                     _state.update { state ->
                         if (state.remoteDirectoryPath != path) return@update state
                         state.copy(
@@ -1318,6 +2425,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 .onFailure { error ->
+                    if (error.isCancellation() || !isCurrentConnection(client, connectionGeneration)) return@onFailure
                     _state.update { state ->
                         if (state.remoteDirectoryPath != path) return@update state
                         state.copy(
@@ -1339,108 +2447,231 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun clearNotice() = _state.update { it.copy(notice = null) }
 
-    private fun observeEvents(client: CodexRpcClient) {
+    private fun isCurrentConnection(client: CodexRpcClient, generation: Long): Boolean =
+        rpc === client && sessionRequestTracker.isCurrentConnection(generation)
+
+    private fun knownSessionThreadIds(): Set<String> = buildSet {
+        addAll(sessionRegistry.sessions.keys)
+        addAll(_state.value.threads.map(RemoteThread::id))
+        _state.value.selectedThreadId?.let(::add)
+    }
+
+    private fun captureSelectedSession(state: AppUiState = _state.value): Boolean {
+        val threadId = state.selectedThreadId ?: return true
+        val cachedTimeline = state.timeline.takeLastWithin(
+            maxItems = sessionRegistry.limits.maxTimelineItems,
+            maxChars = sessionRegistry.limits.maxTimelineChars,
+        )
+        val ready = sessionRegistry.ensureSessionForEvent(
+            threadId = threadId,
+            knownThreadIds = knownSessionThreadIds() + threadId,
+        )
+        if (!ready.applied) {
+            sessionRegistry = ready.registry
+            _state.update { it.copy(isBusy = false, notice = "This task could not be cached safely.") }
+            return false
+        }
+        val thread = state.threads.firstOrNull { it.id == threadId }
+        val updated = ready.registry.updateSession(threadId, markUnread = false) { cached ->
+            cached.copy(
+                thread = thread ?: cached.thread,
+                timeline = cachedTimeline,
+                olderHistoryCursor = state.olderHistoryCursor,
+                hasOlderHistory = state.hasOlderHistory || cachedTimeline.size < state.timeline.size,
+                isOlderHistoryLoading = state.isOlderHistoryLoading,
+                olderHistoryError = state.olderHistoryError,
+                consumedHistoryCursors = state.consumedHistoryCursors,
+                goal = state.threadGoal,
+                tokenUsage = state.threadTokenUsage,
+                settings = SessionSettings(
+                    model = state.selectedModel,
+                    reasoningEffort = state.selectedReasoningEffort,
+                    serviceTier = state.selectedServiceTier,
+                    collaborationMode = state.selectedCollaborationMode,
+                    permissionProfile = state.selectedPermissionProfile,
+                    approvalPolicy = state.approvalPolicy,
+                    approvalsReviewer = state.approvalsReviewer,
+                ),
+                isTurnRunning = state.isTurnRunning,
+                activeTurnId = state.activeTurnId,
+                expectedTurnId = if (state.isTurnRunning) {
+                    state.activeTurnId ?: cached.expectedTurnId
+                } else {
+                    null
+                },
+                streamStatus = when {
+                    state.isTurnRunning -> SessionStreamStatus.RUNNING
+                    cached.streamStatus == SessionStreamStatus.FAILED -> SessionStreamStatus.FAILED
+                    else -> SessionStreamStatus.IDLE
+                },
+            )
+        }
+        return applySessionMutation(updated, "This task exceeded safe cache limits.")
+    }
+
+    private fun projectSessionRegistry() {
+        val registry = sessionRegistry
+        _state.update { it.withSessionRegistry(registry) }
+    }
+
+    private fun rejectNewWorkDuringNetworkHandoff(): Boolean {
+        if (!networkHandoffPending) return false
+        _state.update {
+            it.copy(notice = "Network route changed; wait for SSH reconnection before starting new work.")
+        }
+        return true
+    }
+
+    private fun applySessionMutation(
+        mutation: SessionRegistryMutation,
+        failureNotice: String,
+    ): Boolean {
+        sessionRegistry = mutation.registry
+        if (mutation.applied) return true
+        _state.update { state -> state.copy(isBusy = false, notice = failureNotice) }
+        return false
+    }
+
+    private fun restoreOlderHistoryLoadingAfterRejection(threadId: String) {
+        val restored = sessionRegistry.clearOlderHistoryLoading(threadId)
+        if (!restored.applied) {
+            disconnectInternal(clearActive = false)
+            _state.update { state ->
+                state.copy(
+                    showConnections = true,
+                    notice = "History loading state could not be restored safely; disconnected.",
+                )
+            }
+            return
+        }
+        sessionRegistry = restored.registry
+        projectSessionRegistry()
+    }
+
+    private fun failClosedTurnIdentity(
+        client: CodexRpcClient,
+        connectionGeneration: Long,
+        message: String,
+    ) {
+        if (!isCurrentConnection(client, connectionGeneration)) return
+        disconnectInternal(clearActive = false)
+        _state.update { state ->
+            state.copy(
+                showConnections = true,
+                notice = message,
+            )
+        }
+    }
+
+    private fun routeSessionEvent(
+        client: CodexRpcClient,
+        connectionGeneration: Long,
+        event: AppServerEvent,
+    ): Boolean {
+        if (!isCurrentConnection(client, connectionGeneration)) return false
+        if (!captureSelectedSession()) return false
+        val result = SessionEventRouter.route(
+            registry = sessionRegistry,
+            event = event,
+            knownThreadIds = knownSessionThreadIds(),
+        )
+        sessionRegistry = result.registry
+        projectSessionRegistry()
+        val rejection = (result.disposition as? SessionRouteDisposition.Rejected)?.rejection
+        if (rejection?.disconnectRecommended == true && isCurrentConnection(client, connectionGeneration)) {
+            disconnectInternal(clearActive = false)
+            _state.update { state ->
+                state.copy(
+                    showConnections = true,
+                    notice = "Remote session ownership could not be verified; disconnected without approving.",
+                )
+            }
+        }
+        return result.disposition is SessionRouteDisposition.Applied
+    }
+
+    private fun observeEvents(client: CodexRpcClient, connectionGeneration: Long) {
         eventJob?.cancel()
         eventJob = viewModelScope.launch {
             client.events.collect { event ->
+                if (!isCurrentConnection(client, connectionGeneration)) return@collect
                 when (event) {
                     is AppServerEvent.ItemUpsert -> approvalFlowMutex.withLock {
-                        upsertItem(event.threadId, event.item)
+                        routeSessionEvent(client, connectionGeneration, event)
                     }
-                    is AppServerEvent.AgentDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.AGENT)
-                    is AppServerEvent.PlanDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.PLAN)
-                    is AppServerEvent.ReasoningDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.REASONING)
-                    is AppServerEvent.OutputDelta -> appendDelta(event.threadId, event.itemId, event.delta, TimelineKind.COMMAND)
+                    is AppServerEvent.AgentDelta -> routeSessionEvent(client, connectionGeneration, event)
+                    is AppServerEvent.PlanDelta -> routeSessionEvent(client, connectionGeneration, event)
+                    is AppServerEvent.ReasoningDelta -> routeSessionEvent(client, connectionGeneration, event)
+                    is AppServerEvent.OutputDelta -> routeSessionEvent(client, connectionGeneration, event)
                     is AppServerEvent.TurnRunning -> {
-                        if (!_state.value.acceptsThreadEvent(event.threadId)) return@collect
-                        _state.update { state ->
-                            state.copy(
-                                isTurnRunning = event.running,
-                                activeTurnId = if (event.running) event.turnId else null,
-                                timeline = if (event.running) {
-                                    state.timeline
-                                } else {
-                                    state.timeline.withRunningItemsCompleted()
-                                },
+                        val threadId = event.threadId?.takeIf(String::isNotBlank)
+                        val turnId = event.turnId?.takeIf(String::isNotBlank)
+                        if (event.running && threadId != null && turnId != null &&
+                            !sessionRequestTracker.canObserveTurnStarted(threadId, turnId)
+                        ) {
+                            failClosedTurnIdentity(
+                                client,
+                                connectionGeneration,
+                                "Remote repeated or changed a completed turn ID; disconnected safely.",
                             )
+                            return@collect
                         }
-                        if (!event.running) {
-                            refreshThreads()
-                        }
-                    }
-                    is AppServerEvent.Approval -> {
-                        approvalFlowMutex.withLock {
-                            when (enqueueApproval(event)) {
-                                ApprovalEnqueueStatus.ENQUEUED -> Unit
-                                ApprovalEnqueueStatus.DUPLICATE_ACTIVE_ID -> {
-                                    if (rpc === client) {
-                                        disconnectInternal(clearActive = false)
-                                        _state.update { state ->
-                                            state.copy(
-                                                showConnections = true,
-                                                notice = "Remote sent an ambiguous duplicate approval ID; disconnected without approving.",
-                                            )
-                                        }
-                                    }
-                                }
-                                ApprovalEnqueueStatus.CAPACITY_EXCEEDED -> {
-                                    if (rpc === client) {
-                                        disconnectInternal(clearActive = false)
-                                        _state.update { state ->
-                                            state.copy(
-                                                showConnections = true,
-                                                notice = "Pending approvals exceeded the safe resource limit; disconnected without approving.",
-                                            )
-                                        }
-                                    }
+                        val applied = routeSessionEvent(client, connectionGeneration, event)
+                        if (applied) {
+                            if (threadId != null && turnId != null) {
+                                if (event.running) {
+                                    sessionRequestTracker.observeTurnStarted(threadId, turnId)
+                                } else {
+                                    sessionRequestTracker.observeTurnCompleted(threadId, turnId)
                                 }
                             }
                         }
+                        if (applied && !event.running) {
+                            refreshThreads()
+                        }
                     }
-                    is AppServerEvent.ApprovalResolved -> approvalFlowMutex.withLock {
-                        _state.update { state ->
-                            state.copy(approvalQueue = state.approvalQueue.complete(event.requestId))
+                    is AppServerEvent.Approval -> approvalFlowMutex.withLock {
+                        routeSessionEvent(client, connectionGeneration, event)
+                    }
+                    is AppServerEvent.ApprovalResolved -> {
+                        approvalFlowMutex.withLock {
+                            routeSessionEvent(client, connectionGeneration, event)
                         }
                     }
                     AppServerEvent.AccountChanged -> refreshRemoteAccount()
+                    is AppServerEvent.ThreadStarted -> {
+                        registerStartedThread(event)
+                        refreshThreads()
+                    }
                     AppServerEvent.ThreadsChanged -> refreshThreads()
                     AppServerEvent.SkillsChanged -> refreshComposerCatalog(forceReload = true)
-                    is AppServerEvent.GoalUpdated -> _state.update { state ->
-                        if (state.selectedThreadId == event.threadId) {
-                            state.copy(threadGoal = event.goal, isGoalLoading = false, goalError = null)
-                        } else {
-                            state
-                        }
-                    }
-                    is AppServerEvent.GoalCleared -> {
+                    is AppServerEvent.GoalUpdated -> if (routeSessionEvent(client, connectionGeneration, event)) {
                         _state.update { state ->
                             if (state.selectedThreadId == event.threadId) {
-                                state.copy(threadGoal = null, isGoalLoading = false, goalError = null)
+                                state.copy(isGoalLoading = false, goalError = null)
                             } else {
                                 state
                             }
                         }
                     }
-                    is AppServerEvent.TokenUsageUpdated -> _state.update { state ->
-                        if (state.selectedThreadId == event.threadId) {
-                            state.copy(threadTokenUsage = event.usage)
-                        } else {
-                            state
+                    is AppServerEvent.GoalCleared -> if (routeSessionEvent(client, connectionGeneration, event)) {
+                        _state.update { state ->
+                            if (state.selectedThreadId == event.threadId) {
+                                state.copy(isGoalLoading = false, goalError = null)
+                            } else {
+                                state
+                            }
                         }
                     }
+                    is AppServerEvent.TokenUsageUpdated -> routeSessionEvent(client, connectionGeneration, event)
                     is AppServerEvent.RateLimitsUpdated -> _state.update {
                         it.copy(rateLimits = event.rateLimits, isStatusLoading = false, statusError = null)
                     }
                     is AppServerEvent.ContextCompacted -> {
-                        if (_state.value.selectedThreadId == event.threadId) {
-                            _state.update { state ->
-                                val marker = TimelineItem(
-                                    id = "compaction-${UUID.randomUUID()}",
-                                    kind = TimelineKind.COMPACTION,
-                                    title = "Context compacted",
-                                )
-                                state.copy(timeline = state.timeline + marker, notice = "Task context compacted")
-                            }
+                        if (routeSessionEvent(client, connectionGeneration, event) &&
+                            _state.value.selectedThreadId == event.threadId
+                        ) {
+                            _state.update { it.copy(notice = "Task context compacted") }
                         }
                     }
                     is AppServerEvent.McpLoginCompleted -> {
@@ -1456,23 +2687,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         if (event.success) reloadMcpServers()
                     }
-                    is AppServerEvent.ThreadSettingsUpdated -> _state.update { state ->
-                        if (state.selectedThreadId != event.threadId) return@update state
-                        val model = state.models.firstOrNull { it.id == event.settings.model }
-                        state.copy(
-                            selectedModel = model?.id ?: state.selectedModel,
-                            selectedReasoningEffort = event.settings.reasoningEffort
-                                ?.takeIf { effort -> model?.supports(effort) == true }
-                                ?: state.selectedReasoningEffort,
-                            selectedServiceTier = event.settings.serviceTier,
-                            selectedCollaborationMode = event.settings.collaborationMode
-                                ?.takeIf { mode -> state.collaborationModes.any { it.mode == mode } }
-                                ?: state.selectedCollaborationMode,
-                            selectedPermissionProfile = event.settings.permissionProfile,
-                            approvalPolicy = event.settings.approvalPolicy ?: state.approvalPolicy,
-                            approvalsReviewer = event.settings.approvalsReviewer ?: state.approvalsReviewer,
-                        )
-                    }
+                    is AppServerEvent.ThreadSettingsUpdated -> routeSessionEvent(client, connectionGeneration, event)
                     is AppServerEvent.LoginCompleted -> {
                         if (event.success) {
                             _state.update { it.copy(remoteDeviceLogin = null, isLoginStarting = false) }
@@ -1491,21 +2706,32 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         val message = friendlyError(IllegalStateException(event.message))
                         if (event.threadId == null) {
                             if (rpc === client) {
-                                disconnectInternal(clearActive = false)
-                                _state.update { it.afterGlobalAppServerFailure(message) }
+                                if (event.kind == FailureKind.TRANSPORT && shouldMaintainConnection) {
+                                    val hadUnconfirmedWork =
+                                        (_state.value.connectionStatus == ConnectionStatus.CONNECTED &&
+                                            event.hadPendingRequests) ||
+                                        hasRunningTurn() ||
+                                        hasPendingApproval()
+                                    if (suspendForAmbiguousApprovalDelivery()) return@collect
+                                    if (hadUnconfirmedWork) {
+                                        reconnectHadUnconfirmedWork = true
+                                        Log.w(
+                                            CONNECTION_LOG_TAG,
+                                            "state=transport_interrupted in_flight_work_unconfirmed=true",
+                                        )
+                                    }
+                                    rememberSelectionForReconnect()
+                                    disconnectInternal(clearActive = false, suspendMaintenance = false)
+                                    scheduleReconnect(message)
+                                } else {
+                                    disconnectInternal(clearActive = false)
+                                    _state.update { it.afterGlobalAppServerFailure(message) }
+                                }
                             }
                         } else {
-                            _state.update { state ->
-                                if (state.acceptsThreadEvent(event.threadId)) {
-                                    state.copy(
-                                        notice = message,
-                                        isTurnRunning = false,
-                                        activeTurnId = null,
-                                        timeline = state.timeline.withRunningItemsCompleted(),
-                                    )
-                                } else {
-                                    state
-                                }
+                            val applied = routeSessionEvent(client, connectionGeneration, event)
+                            if (applied && _state.value.selectedThreadId == event.threadId) {
+                                _state.update { state -> state.copy(notice = message) }
                             }
                         }
                     }
@@ -1533,30 +2759,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun enqueueApproval(event: AppServerEvent.Approval): ApprovalEnqueueStatus {
-        while (true) {
-            val state = _state.value
-            val cachedItem = event.request.approvalFileItemKey()?.let(state.approvalFileItems::get)
-            val request = event.request
-                .bindFileChangesSnapshot(state.timeline, state.selectedThreadId)
-                .let { pending ->
-                    if (cachedItem == null) pending
-                    else pending.bindFileChangesSnapshot(event.threadId, cachedItem)
-                }
-            val result = state.approvalQueue.enqueueResult(request)
-            if (result.status != ApprovalEnqueueStatus.ENQUEUED) return result.status
-            if (_state.compareAndSet(state, state.copy(approvalQueue = result.queue))) return result.status
-        }
-    }
-
     private fun refreshRemoteAccount() {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             runCatching {
                 val account = client.readAccount()
                 val models = client.listModels()
                 account to models
             }.onSuccess { (account, models) ->
+                if (!isCurrentConnection(client, connectionGeneration)) return@onSuccess
                 _state.update { state ->
                     val selected = models.firstOrNull { it.id == state.selectedModel }
                         ?: models.firstOrNull { it.isDefault }
@@ -1575,7 +2788,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         selectedServiceTier = serviceTier,
                     )
                 }
-            }.onFailure(::showError)
+            }.onFailure { error ->
+                if (!error.isCancellation() && isCurrentConnection(client, connectionGeneration)) showError(error)
+            }
         }
     }
 
@@ -1595,6 +2810,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } else {
                 state
+            }
+        }
+    }
+
+    private fun applyGoalResult(threadId: String, goal: com.codex.remote.domain.ThreadGoal?) {
+        if (!captureSelectedSession()) return
+        val updated = sessionRegistry.updateSession(threadId, markUnread = false) {
+            it.copy(goal = goal)
+        }
+        if (!applySessionMutation(updated, "Remote goal state could not be cached safely.")) return
+        _state.update { state ->
+            val projected = state.withSessionRegistry(sessionRegistry)
+            if (projected.selectedThreadId == threadId) {
+                projected.copy(isGoalLoading = false, goalError = null)
+            } else {
+                projected
             }
         }
     }
@@ -1620,59 +2851,25 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun upsertItem(threadId: String?, item: TimelineItem) = _state.update { state ->
-        val approvalFileItems = state.approvalFileItems.recordFileApprovalItem(threadId, item)
-        val approvalQueue = if (threadId != null) {
-            state.approvalQueue.bindFileChangeSnapshot(threadId, item)
-        } else {
-            state.approvalQueue
-        }
-        if (!state.acceptsThreadEvent(threadId)) {
-            return@update state.copy(
-                approvalQueue = approvalQueue,
-                approvalFileItems = approvalFileItems,
-            )
-        }
-        val index = state.timeline.indexOfFirst { existing ->
-            existing.id == item.id && (item.turnId == null || existing.turnId == item.turnId)
-        }
-        val localUserIndex = if (item.kind == TimelineKind.USER) {
-            state.timeline.indexOfLast { it.id.startsWith("local-") && it.kind == TimelineKind.USER && it.body == item.body }
-        } else -1
-        val timeline = if (index < 0 && localUserIndex >= 0) {
-            state.timeline.toMutableList().also { it[localUserIndex] = item }
-        } else if (index < 0) {
-            state.timeline + item
-        } else {
-            state.timeline.toMutableList().also { it[index] = item }
-        }
-        state.copy(
-            timeline = timeline,
-            approvalQueue = approvalQueue.bindFileChangeSnapshots(timeline, state.selectedThreadId),
-            approvalFileItems = approvalFileItems,
-        )
-    }
-
-    private fun appendDelta(threadId: String?, id: String, delta: String, kind: TimelineKind) = _state.update { state ->
-        if (!state.acceptsThreadEvent(threadId)) return@update state
-        val index = state.timeline.indexOfFirst { it.id == id }
-        if (index < 0) {
-            state.copy(timeline = state.timeline + TimelineItem(id, kind, body = delta, status = "inProgress"))
-        } else {
-            state.copy(timeline = state.timeline.toMutableList().also { items ->
-                val current = items[index]
-                items[index] = current.copy(body = current.body + delta)
-            })
-        }
-    }
-
     private fun refreshThreads() {
         val client = rpc ?: return
         if (_state.value.activeConnection == null) return
+        val connectionEpoch = sessionRequestTracker.connectionGeneration
         viewModelScope.launch {
             runCatching { client.listThreads() }
                 .onSuccess { threads ->
+                    if (rpc !== client || sessionRequestTracker.connectionGeneration != connectionEpoch) {
+                        return@onSuccess
+                    }
+                    if (!captureSelectedSession()) return@onSuccess
+                    for (thread in threads.filter { it.id in sessionRegistry.sessions }) {
+                        val refreshed = sessionRegistry.refreshThreadMetadata(thread)
+                        if (!applySessionMutation(refreshed, "Task metadata could not be refreshed safely.")) {
+                            return@onSuccess
+                        }
+                    }
                     val projects = groupThreadsByProject(threads)
+                    val previousSelection = _state.value.selectionContext()
                     _state.update { state ->
                         val selectedPath = state.selectedProjectPath
                             ?.takeIf { path -> projects.any { it.path == path } }
@@ -1705,8 +2902,50 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             ),
                         )
                     }
+                    val currentSelection = _state.value.selectionContext()
+                    sessionRequestTracker.reconcileSelection(
+                        previousThreadId = previousSelection.threadId,
+                        previousProjectPath = previousSelection.projectPath,
+                        currentThreadId = currentSelection.threadId,
+                        currentProjectPath = currentSelection.projectPath,
+                    )
+                    if (_state.value.selectedThreadId == null) {
+                        if (previousSelection.threadId != null) {
+                            _state.update { state ->
+                                state.copy(
+                                    selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                                    approvalPolicy = SAFE_APPROVAL_POLICY,
+                                    approvalsReviewer = SAFE_APPROVALS_REVIEWER,
+                                )
+                            }
+                        }
+                        sessionRegistry = sessionRegistry.clearSelection()
+                    }
+                    projectSessionRegistry()
                 }
         }
+    }
+
+    private fun registerStartedThread(event: AppServerEvent.ThreadStarted) {
+        if (!captureSelectedSession()) return
+        val registered = sessionRegistry.registerThread(event.threadId, event.thread)
+        sessionRegistry = registered.registry
+        if (!registered.applied) {
+            _state.update { state ->
+                state.copy(notice = "A newly started remote task could not be cached safely")
+            }
+            return
+        }
+        event.thread?.let { started ->
+            _state.update { state ->
+                val threads = (listOf(started) + state.threads).distinctBy(RemoteThread::id)
+                state.copy(
+                    threads = threads,
+                    projects = groupThreadsByProject(threads),
+                )
+            }
+        }
+        projectSessionRegistry()
     }
 
     private suspend fun loadComposerCatalog(
@@ -1721,6 +2960,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val plugins = runCatching {
             withTimeout(45_000) { client.listInstalledPlugins(distinctCwds) }
         }
+        skills.exceptionOrNull()?.let { error -> if (error.isCancellation()) throw error }
+        plugins.exceptionOrNull()?.let { error -> if (error.isCancellation()) throw error }
         val errors = listOfNotNull(
             skills.exceptionOrNull()?.message?.let { "Skills: $it" },
             plugins.exceptionOrNull()?.message?.let { "Plugins: $it" },
@@ -1734,10 +2975,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun refreshComposerCatalog(forceReload: Boolean = false) {
         val client = rpc ?: return
+        val connectionGeneration = sessionRequestTracker.connectionGeneration
         val cwds = _state.value.projects.map { it.path }.filter(String::isNotBlank)
         _state.update { it.copy(isComposerCatalogLoading = true, composerCatalogError = null) }
         viewModelScope.launch {
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             val catalog = loadComposerCatalog(client, cwds, forceReload)
+            if (!isCurrentConnection(client, connectionGeneration)) return@launch
             _state.update {
                 it.copy(
                     skills = catalog.skills,
@@ -1753,11 +2997,52 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(isBusy = false, notice = friendlyError(error)) }
     }
 
+    private fun closeClientInBackground(client: CodexRpcClient?) {
+        if (client == null) return
+        client.beginClose()
+        transportCleanupScope.launch {
+            runCatching { client.close() }
+        }
+    }
+
     override fun onCleared() {
-        rpc?.close()
+        val detachedClient = rpc
+        rpc = null
+        closeClientInBackground(detachedClient)
         super.onCleared()
     }
 }
+
+internal data class SessionSelectionContext(
+    val threadId: String?,
+    val projectPath: String?,
+)
+
+internal fun AppUiState.selectionContext(): SessionSelectionContext = SessionSelectionContext(
+    threadId = selectedThreadId,
+    projectPath = selectedProjectPath,
+)
+
+internal fun AppUiState.matchesSelection(context: SessionSelectionContext): Boolean =
+    selectedThreadId == context.threadId && selectedProjectPath == context.projectPath
+
+internal fun resolveResumedTurnId(
+    remoteActiveTurnId: String?,
+    cachedIsRunning: Boolean,
+    cachedActiveTurnId: String?,
+    cachedExpectedTurnId: String?,
+): String? = remoteActiveTurnId?.takeIf(String::isNotBlank)
+    ?: if (cachedIsRunning) {
+        cachedActiveTurnId?.takeIf(String::isNotBlank)
+            ?: cachedExpectedTurnId?.takeIf(String::isNotBlank)
+    } else {
+        null
+    }
+
+internal fun SessionRegistry.clearOlderHistoryLoading(threadId: String): SessionRegistryMutation =
+    updateSession(threadId, markUnread = false) { session ->
+        session.copy(isOlderHistoryLoading = false)
+    }
 
 internal fun friendlyError(error: Throwable): String {
     val causeMessages = generateSequence(error) { it.cause }
@@ -1784,6 +3069,75 @@ internal fun friendlyError(error: Throwable): String {
     }
 }
 
+internal fun AppUiState.withSessionRegistry(registry: SessionRegistry): AppUiState {
+    val indicators = registry.sessions.mapValues { (_, session) ->
+        ThreadSessionIndicator(
+            isRunning = session.isTurnRunning,
+            approvalCount = session.approvalQueue.entries.size,
+            unreadCount = session.unreadCount,
+            hasFailure = session.streamStatus == SessionStreamStatus.FAILED,
+        )
+    }
+    val visibleApprovals = registry.visibleApprovalQueue(approvalQueue)
+    val session = registry.selectedSession
+        ?: return copy(
+            sessionIndicators = indicators,
+            approvalQueue = visibleApprovals,
+        )
+    val authorization = session.settings.safeAuthorizationOrDefault()
+    val defaults = defaultSessionSettings()
+    val configuredModel = session.settings.model
+        ?.takeIf { id -> models.any { it.id == id } }
+        ?: defaults.model
+    val model = models.firstOrNull { it.id == configuredModel }
+    return copy(
+        selectedThreadId = session.threadId,
+        sessionIndicators = indicators,
+        timeline = session.timeline,
+        olderHistoryCursor = session.olderHistoryCursor,
+        hasOlderHistory = session.hasOlderHistory,
+        isOlderHistoryLoading = session.isOlderHistoryLoading,
+        olderHistoryError = session.olderHistoryError,
+        consumedHistoryCursors = session.consumedHistoryCursors,
+        threadGoal = session.goal,
+        threadTokenUsage = session.tokenUsage,
+        isTurnRunning = session.isTurnRunning,
+        activeTurnId = session.activeTurnId,
+        approvalQueue = visibleApprovals,
+        selectedModel = configuredModel,
+        selectedReasoningEffort = session.settings.reasoningEffort
+            ?.takeIf { effort -> model?.supports(effort) == true }
+            ?: model?.preferredReasoningEffort()
+            ?: defaults.reasoningEffort,
+        selectedServiceTier = session.settings.serviceTier
+            ?.takeIf { tier -> model?.serviceTiers?.any { it.id == tier } == true }
+            ?: model?.defaultServiceTier
+            ?: defaults.serviceTier,
+        selectedCollaborationMode = session.settings.collaborationMode
+            ?.takeIf { mode -> collaborationModes.any { it.mode == mode } }
+            ?: defaults.collaborationMode
+            ?: "default",
+        selectedPermissionProfile = authorization.permissionProfile,
+        approvalPolicy = requireNotNull(authorization.approvalPolicy),
+        approvalsReviewer = requireNotNull(authorization.approvalsReviewer),
+    )
+}
+
+private fun List<TimelineItem>.takeLastWithin(maxItems: Int, maxChars: Long): List<TimelineItem> {
+    var start = size
+    var retainedItems = 0
+    var retainedChars = 0L
+    for (index in lastIndex downTo 0) {
+        if (retainedItems >= maxItems) break
+        val itemChars = this[index].retainedCharacterCount()
+        if (itemChars > maxChars - retainedChars) break
+        retainedItems += 1
+        retainedChars += itemChars
+        start = index
+    }
+    return subList(start, size).toList()
+}
+
 private data class ConnectionBootstrap(
     val server: RemoteServerInfo,
     val account: RemoteAccount,
@@ -1793,8 +3147,77 @@ private data class ConnectionBootstrap(
     val permissionProfiles: List<com.codex.remote.domain.RemotePermissionProfile>,
 )
 
-internal fun AppUiState.acceptsThreadEvent(threadId: String?): Boolean =
-    selectedThreadId != null && selectedThreadId == threadId
+private data class ReconnectSelection(
+    val projectPath: String?,
+    val threadId: String?,
+)
+
+private class SupersededConnectionException : Exception("Connection attempt was superseded")
+
+private fun Throwable.isCancellation(): Boolean =
+    generateSequence(this) { it.cause }.any {
+        it is CancellationException && it !is TimeoutCancellationException
+    }
+
+internal fun Throwable.isRetryableConnectionFailure(): Boolean {
+    val causes = generateSequence(this) { it.cause }.toList()
+    if (causes.any {
+            it is UnknownHostKeyException ||
+                it is HostKeyChangedException ||
+                it is RemoteCodexUnavailableException ||
+                it is SecurityException
+        }
+    ) {
+        return false
+    }
+    if (causes.any { cause ->
+            val type = cause::class.java.simpleName.lowercase()
+            val message = cause.message.orEmpty().lowercase()
+            type.contains("userauth") ||
+                message.contains("authentication") ||
+                message.contains("auth fail") ||
+                message.contains("permission denied") ||
+                message.contains("private key") ||
+                message.contains("password")
+        }
+    ) {
+        return false
+    }
+    causes.filterIsInstance<SSHException>().forEach { error ->
+        when (error.disconnectReason) {
+            DisconnectReason.CONNECTION_LOST -> return true
+            DisconnectReason.UNKNOWN -> Unit
+            else -> return false
+        }
+    }
+    if (causes.any { cause ->
+            val message = cause.message.orEmpty().lowercase()
+            message.contains("protocol error") ||
+                message.contains("protocol version") ||
+                message.contains("key exchange") ||
+                message.contains("algorithm negotiation") ||
+                message.contains("no matching") ||
+                message.contains("mac error") ||
+                message.contains("host key")
+        }
+    ) {
+        return false
+    }
+    if (causes.any { it is IOException || it is TimeoutCancellationException }) {
+        return true
+    }
+    return causes.any { cause ->
+        val message = cause.message.orEmpty().lowercase()
+        cause is RpcException && message.contains("connection closed") ||
+            message.contains("connection reset") ||
+            message.contains("broken pipe") ||
+            message.contains("timed out") ||
+            message.contains("timeout") ||
+            message.contains("network is unreachable") ||
+            message.contains("no route to host") ||
+            message.contains("stream was interrupted")
+    }
+}
 
 internal fun AppUiState.afterGlobalAppServerFailure(message: String): AppUiState =
     afterDisconnect(clearActive = false).copy(
@@ -1804,7 +3227,7 @@ internal fun AppUiState.afterGlobalAppServerFailure(message: String): AppUiState
         notice = message,
     )
 
-private fun AppUiState.afterDisconnect(clearActive: Boolean): AppUiState = copy(
+internal fun AppUiState.afterDisconnect(clearActive: Boolean): AppUiState = copy(
     activeConnection = if (clearActive) null else activeConnection,
     connectionStatus = ConnectionStatus.DISCONNECTED,
     connectionMessage = "",
@@ -1813,6 +3236,7 @@ private fun AppUiState.afterDisconnect(clearActive: Boolean): AppUiState = copy(
     isArchivedThreadsLoading = false,
     archivedThreadsError = null,
     projects = if (clearActive) emptyList() else projects,
+    sessionIndicators = emptyMap(),
     selectedProjectPath = if (clearActive) null else selectedProjectPath,
     selectedThreadId = null,
     threadGoal = null,
@@ -1831,8 +3255,9 @@ private fun AppUiState.afterDisconnect(clearActive: Boolean): AppUiState = copy(
     collaborationModes = emptyList(),
     selectedCollaborationMode = "default",
     permissionProfiles = emptyList(),
-    selectedPermissionProfile = null,
-    approvalsReviewer = "user",
+    selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+    approvalPolicy = SAFE_APPROVAL_POLICY,
+    approvalsReviewer = SAFE_APPROVALS_REVIEWER,
     remoteServer = null,
     remoteAccount = null,
     remoteDeviceLogin = null,
@@ -1850,21 +3275,52 @@ private fun AppUiState.afterDisconnect(clearActive: Boolean): AppUiState = copy(
     statusError = null,
     isTurnRunning = false,
     activeTurnId = null,
+    isBusy = false,
     approvalQueue = ApprovalQueue(),
     approvalFileItems = emptyMap(),
     pendingHostKeyFingerprint = null,
 )
 
+private const val SAFE_PERMISSION_PROFILE = ":workspace"
+private const val SAFE_APPROVAL_POLICY = "on-request"
+private const val SAFE_APPROVALS_REVIEWER = "user"
+private const val NETWORK_CHANGE_DEBOUNCE_MILLIS = 500L
+private const val NETWORK_HANDOFF_RECHECK_MILLIS = 1_000L
+private const val NETWORK_PENDING_RPC_GRACE_MILLIS = 5_000L
+private const val RECONNECT_STABILITY_WINDOW_MILLIS = 30_000L
+private const val CONNECTION_LOG_TAG = "CodexRemoteConnection"
+
+private fun SessionSettings.safeAuthorizationOrDefault(): SessionSettings {
+    val profile = permissionProfile?.takeIf(String::isNotBlank)
+    val policy = approvalPolicy?.takeIf(String::isNotBlank)
+    val reviewer = approvalsReviewer?.takeIf(String::isNotBlank)
+    return if (profile != null && policy != null && reviewer != null) {
+        copy(
+            permissionProfile = profile,
+            approvalPolicy = policy,
+            approvalsReviewer = reviewer,
+        )
+    } else {
+        copy(
+            permissionProfile = SAFE_PERMISSION_PROFILE,
+            approvalPolicy = SAFE_APPROVAL_POLICY,
+            approvalsReviewer = SAFE_APPROVALS_REVIEWER,
+        )
+    }
+}
+
+internal fun SessionSettings.withRemoteAuthorization(
+    permissionProfile: String?,
+    approvalPolicy: String?,
+    approvalsReviewer: String?,
+): SessionSettings = copy(
+    permissionProfile = permissionProfile,
+    approvalPolicy = approvalPolicy,
+    approvalsReviewer = approvalsReviewer,
+).safeAuthorizationOrDefault()
+
 internal const val MAX_CACHED_APPROVAL_FILE_ITEMS = 256
 internal const val MAX_CACHED_APPROVAL_FILE_CHARS = 4L * 1024L * 1024L
-
-private fun ApprovalRequest.approvalFileItemKey(): ApprovalFileItemKey? {
-    if (kind != com.codex.remote.domain.ApprovalKind.FILE_CHANGE || rawMethod == "applyPatchApproval") return null
-    val threadId = threadId?.takeIf(String::isNotBlank) ?: return null
-    val turnId = turnId?.takeIf(String::isNotBlank) ?: return null
-    val itemId = itemId?.takeIf(String::isNotBlank) ?: return null
-    return ApprovalFileItemKey(threadId, turnId, itemId)
-}
 
 private fun Map<ApprovalFileItemKey, TimelineItem>.recordFileApprovalItems(
     threadId: String,
@@ -1912,6 +3368,9 @@ internal fun Map<ApprovalFileItemKey, TimelineItem>.recordFileApprovalItem(
 
 internal fun List<SavedConnection>.lastUsedConnectionOrNull(): SavedConnection? =
     maxByOrNull(SavedConnection::lastUsedAt)?.takeIf { it.lastUsedAt > 0 }
+
+internal fun List<SavedConnection>.desiredConnectionOrNull(desiredConnectionId: String?): SavedConnection? =
+    desiredConnectionId?.let { desiredId -> firstOrNull { it.id == desiredId } }
 
 internal fun Throwable.isUnsupportedRpcMethod(method: String): Boolean =
     generateSequence(this) { it.cause }.any { error ->
@@ -1961,6 +3420,19 @@ private fun AppUiState.defaultCollaborationMode(): String =
         ?: collaborationModes.firstOrNull()?.mode
         ?: "default"
 
+internal fun AppUiState.defaultSessionSettings(): SessionSettings {
+    val model = models.firstOrNull(RemoteModel::isDefault) ?: models.firstOrNull()
+    return SessionSettings(
+        model = model?.id,
+        reasoningEffort = model?.preferredReasoningEffort(),
+        serviceTier = model?.defaultServiceTier,
+        collaborationMode = defaultCollaborationMode(),
+        permissionProfile = SAFE_PERMISSION_PROFILE,
+        approvalPolicy = SAFE_APPROVAL_POLICY,
+        approvalsReviewer = SAFE_APPROVALS_REVIEWER,
+    )
+}
+
 private fun String.isActiveTimelineStatus(): Boolean =
     equals("inProgress", ignoreCase = true) ||
         equals("in_progress", ignoreCase = true) ||
@@ -1973,6 +3445,14 @@ internal fun List<TimelineItem>.withRunningItemsCompleted(): List<TimelineItem> 
 
 private fun String.isRemoteThreadActive(): Boolean =
     equals("active", ignoreCase = true) || equals("inProgress", ignoreCase = true)
+
+internal fun shouldBlockArchive(thread: RemoteThread, session: SessionState?): Boolean =
+    thread.status.isRemoteThreadActive() || session?.hasProtectedWork == true
+
+internal fun approvalBelongsToLiveTurn(owner: SessionState, request: ApprovalRequest): Boolean {
+    val turnId = request.turnId?.takeIf(String::isNotBlank) ?: return false
+    return owner.isTurnRunning && (turnId == owner.activeTurnId || turnId == owner.expectedTurnId)
+}
 
 private fun connectionSummary(projects: Int, threads: Int, codexVersion: String): String = buildString {
     append("Imported $projects projects and $threads sessions")

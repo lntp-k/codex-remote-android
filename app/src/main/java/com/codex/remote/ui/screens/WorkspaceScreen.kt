@@ -172,6 +172,7 @@ import com.codex.remote.domain.TimelineItem
 import com.codex.remote.domain.TimelineKind
 import com.codex.remote.domain.ThreadGoal
 import com.codex.remote.domain.ThreadGoalStatus
+import com.codex.remote.domain.ThreadSessionIndicator
 import com.codex.remote.domain.aggregateFileChangePreview
 import com.codex.remote.domain.composerToken
 import com.codex.remote.domain.findComposerTrigger
@@ -391,13 +392,28 @@ fun WorkspaceScreen(
 
     state.approvalQueue.currentEntry?.let { entry ->
         val approval = entry.request
-        val fileChanges = approval.resolvedFileChanges(state.timeline, state.selectedThreadId)
+        val owner = approvalOwnerPresentation(
+            threadId = approval.threadId,
+            selectedThreadId = state.selectedThreadId,
+            threads = state.threads,
+            fallbackPath = approval.cwd,
+        )
+        val ownerTimeline = state.timeline.takeIf { owner?.isSelected == true }.orEmpty()
+        val fileChanges = approval.resolvedFileChanges(ownerTimeline, owner?.threadId)
         ApprovalDialog(
             requestKey = entry.key,
             approval = approval,
+            owner = owner,
             fileChanges = fileChanges,
-            canApprove = approval.canApprove(state.timeline, state.selectedThreadId),
+            canApprove = owner?.let { presentation ->
+                presentation.isSelected &&
+                    approvalMatchesSelectedActiveTurn(approval.threadId, approval.turnId, state) &&
+                    approval.canApprove(ownerTimeline, presentation.threadId)
+            } == true,
             isResponding = entry.key in state.approvalQueue.respondingKeys,
+            onOpenOwner = owner?.takeUnless { it.isSelected }?.thread?.let { thread ->
+                { onSelectThread(thread) }
+            },
             onDecision = onApproval,
             onDisconnect = onDisconnect,
         )
@@ -589,6 +605,7 @@ private fun WorkspaceSidebar(
                     items(project.threads, key = { "thread-${it.id}" }) { thread ->
                         ThreadSidebarRow(
                             thread = thread,
+                            indicator = state.sessionIndicators[thread.id],
                             selected = thread.id == state.selectedThreadId,
                             onSelect = { onSelectThread(thread) },
                             onRename = { onRenameThread(thread) },
@@ -637,6 +654,7 @@ private fun WorkspaceSidebar(
 @Composable
 private fun ThreadSidebarRow(
     thread: RemoteThread,
+    indicator: ThreadSessionIndicator?,
     selected: Boolean,
     onSelect: () -> Unit,
     onRename: () -> Unit,
@@ -676,8 +694,44 @@ private fun ThreadSidebarRow(
             )
             Spacer(Modifier.width(4.dp))
         }
-        if (thread.status.contains("active", true)) {
-            Box(Modifier.size(6.dp).clip(CircleShape).background(MaterialTheme.colorScheme.secondary))
+        if (indicator?.approvalCount?.let { it > 0 } == true) {
+            Text(
+                "!${indicator.approvalCount}",
+                modifier = Modifier.semantics {
+                    contentDescription = "${indicator.approvalCount} approvals required"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            Spacer(Modifier.width(5.dp))
+        }
+        if (indicator?.unreadCount?.let { it > 0 } == true) {
+            Text(
+                indicator.unreadCount.toString(),
+                modifier = Modifier.semantics {
+                    contentDescription = "${indicator.unreadCount} unread task updates"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.width(5.dp))
+        }
+        val statusColor = when {
+            indicator?.hasFailure == true -> MaterialTheme.colorScheme.error
+            indicator?.isRunning == true || thread.status.contains("active", true) ->
+                MaterialTheme.colorScheme.secondary
+            else -> null
+        }
+        if (statusColor != null) {
+            Box(
+                Modifier
+                    .size(6.dp)
+                    .semantics {
+                        contentDescription = if (indicator?.hasFailure == true) "Task failed" else "Task running"
+                    }
+                    .clip(CircleShape)
+                    .background(statusColor),
+            )
         }
         Box {
             IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(34.dp)) {
@@ -887,6 +941,13 @@ private fun WorkspaceContent(
             ConnectionStatus.CONNECTING -> ConnectionState(
                 icon = null,
                 title = "Connecting over SSH",
+                detail = state.connectionMessage,
+                loading = true,
+                modifier = Modifier.fillMaxSize().padding(padding),
+            )
+            ConnectionStatus.RECONNECTING -> ConnectionState(
+                icon = null,
+                title = "Restoring connection",
                 detail = state.connectionMessage,
                 loading = true,
                 modifier = Modifier.fillMaxSize().padding(padding),
@@ -3941,9 +4002,11 @@ private fun ConnectionState(
 private fun ApprovalDialog(
     requestKey: ApprovalQueueKey,
     approval: com.codex.remote.domain.ApprovalRequest,
+    owner: ApprovalOwnerPresentation?,
     fileChanges: List<FileChangeSummary>,
     canApprove: Boolean,
     isResponding: Boolean,
+    onOpenOwner: (() -> Unit)?,
     onDecision: (ApprovalQueueKey, String, Map<String, List<String>>) -> Unit,
     onDisconnect: () -> Unit,
 ) {
@@ -3970,6 +4033,7 @@ private fun ApprovalDialog(
                 modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                ApprovalOwnerBlock(owner = owner, onOpenOwner = onOpenOwner)
                 if (approval.kind == ApprovalKind.USER_INPUT) {
                     Text(approval.detail, style = MaterialTheme.typography.bodyMedium)
                     approval.questions.forEach { question ->
@@ -4117,6 +4181,99 @@ private fun ApprovalDialog(
             }
         },
     )
+}
+
+@Composable
+private fun ApprovalOwnerBlock(
+    owner: ApprovalOwnerPresentation?,
+    onOpenOwner: (() -> Unit)?,
+) {
+    val background = owner?.isSelected != true
+    Surface(
+        color = if (background) {
+            MaterialTheme.colorScheme.errorContainer
+        } else {
+            MaterialTheme.colorScheme.secondaryContainer
+        },
+        shape = RoundedCornerShape(5.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                if (background) "Approval for another task" else "Approval owner",
+                style = MaterialTheme.typography.labelLarge,
+            )
+            if (owner == null) {
+                Text(
+                    "The owning task could not be verified. Allowing is disabled.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                Text(owner.title, style = MaterialTheme.typography.bodyMedium)
+                owner.projectPath?.let { path ->
+                    SelectionContainer {
+                        Text(path, style = MonoText, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                SelectionContainer {
+                    Text(
+                        "Task ID: ${owner.threadId}",
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (background) {
+                    Text(
+                        "Open this task before allowing. Denial remains available from here.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            if (onOpenOwner != null) {
+                OutlinedButton(onClick = onOpenOwner) { Text("Open owning task") }
+            }
+        }
+    }
+}
+
+internal data class ApprovalOwnerPresentation(
+    val threadId: String,
+    val title: String,
+    val projectPath: String?,
+    val isSelected: Boolean,
+    val thread: RemoteThread?,
+)
+
+internal fun approvalOwnerPresentation(
+    threadId: String?,
+    selectedThreadId: String?,
+    threads: List<RemoteThread>,
+    fallbackPath: String? = null,
+): ApprovalOwnerPresentation? {
+    val exactThreadId = threadId?.takeIf(String::isNotBlank) ?: return null
+    val thread = threads.firstOrNull { it.id == exactThreadId }
+    return ApprovalOwnerPresentation(
+        threadId = exactThreadId,
+        title = thread?.title?.takeIf(String::isNotBlank) ?: "Task $exactThreadId",
+        projectPath = thread?.cwd?.takeIf(String::isNotBlank) ?: fallbackPath?.takeIf(String::isNotBlank),
+        isSelected = thread != null && selectedThreadId == exactThreadId,
+        thread = thread,
+    )
+}
+
+internal fun approvalMatchesSelectedActiveTurn(
+    threadId: String?,
+    turnId: String?,
+    state: AppUiState,
+): Boolean {
+    val exactThreadId = threadId?.takeIf(String::isNotBlank) ?: return false
+    val exactTurnId = turnId?.takeIf(String::isNotBlank) ?: return false
+    return state.isTurnRunning &&
+        state.selectedThreadId == exactThreadId &&
+        state.activeTurnId == exactTurnId
 }
 
 private fun hiddenFileTargetsMessage(

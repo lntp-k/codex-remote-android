@@ -251,6 +251,7 @@ data class RemoteThreadSession(
     val approvalPolicy: String? = null,
     val approvalsReviewer: String? = null,
     val permissionProfile: String? = null,
+    val activeTurnId: String? = null,
 )
 
 data class RemoteThreadHistoryPage(
@@ -815,6 +816,13 @@ data class ApprovalQueue(
         return complete(entry.key)
     }
 
+    fun complete(threadId: String, requestId: RpcRequestId): ApprovalQueue {
+        val entry = entries.firstOrNull { queued ->
+            queued.request.requestId == requestId && queued.request.threadId == threadId
+        } ?: return this
+        return complete(entry.key)
+    }
+
     fun bindFileChangeSnapshots(
         timeline: List<TimelineItem>,
         selectedThreadId: String?,
@@ -869,7 +877,14 @@ data class ApprovalQueue(
     }
 }
 
-enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
+enum class ConnectionStatus { DISCONNECTED, CONNECTING, RECONNECTING, CONNECTED, ERROR }
+
+data class ThreadSessionIndicator(
+    val isRunning: Boolean = false,
+    val approvalCount: Int = 0,
+    val unreadCount: Int = 0,
+    val hasFailure: Boolean = false,
+)
 
 data class AppUiState(
     val savedConnections: List<SavedConnection> = emptyList(),
@@ -881,6 +896,7 @@ data class AppUiState(
     val isArchivedThreadsLoading: Boolean = false,
     val archivedThreadsError: String? = null,
     val projects: List<RemoteProject> = emptyList(),
+    val sessionIndicators: Map<String, ThreadSessionIndicator> = emptyMap(),
     val skills: List<RemoteSkill> = emptyList(),
     val plugins: List<RemotePlugin> = emptyList(),
     val remoteDirectoryPath: String? = null,

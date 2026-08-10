@@ -23,16 +23,14 @@ require(releaseSigningValues.none { !it.isNullOrBlank() } || hasReleaseSigning) 
 
 android {
     namespace = "com.codex.remote"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.codex.remote"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 7
-        versionName = "0.1.6"
-        resourceConfigurations += listOf("en", "ko")
-
+        targetSdk = 36
+        versionCode = 9
+        versionName = "0.1.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
     }
@@ -73,6 +71,10 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+
+    androidResources {
+        localeFilters += listOf("en", "ko")
     }
 
     testOptions {

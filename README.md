@@ -49,7 +49,7 @@ endorsed by OpenAI. Codex and OpenAI are trademarks of their respective owner.
 ## Build
 
 Open this directory in Android Studio, or run `./gradlew assembleDebug` with
-JDK 17 and Android SDK 35 installed.
+JDK 17 and Android SDK 36 installed.
 
 Run the device-side regression suite on a connected emulator or Android device:
 
@@ -60,6 +60,21 @@ Run the device-side regression suite on a connected emulator or Android device:
 The first SSH handshake asks you to verify its SHA-256 host-key fingerprint
 before any password or private key is sent. Subsequent key changes are blocked
 until the saved fingerprint is explicitly cleared by editing the connection.
+
+While a connection is active, Android shows a persistent foreground-service
+notification with an explicit **Disconnect** action. Moving the app to the
+background or removing its Activity does not intentionally close SSH. When the
+default network changes (for example Wi-Fi, cellular, or VPN), the old TCP
+socket cannot migrate. The app opens a fresh SSH/app-server connection after
+in-flight turns and approvals reach a safe boundary, then reloads the selected
+remote task. Other pending RPCs get a five-second completion grace; new turns,
+reviews, and forks are briefly blocked during the handoff. Transport failures
+use capped exponential backoff and never replay a message or approval response
+automatically. Android Doze and an absent default network pause dialing without
+spending the retry budget. After ten actual failed dials, the app keeps its
+foreground monitor and resumes from a fresh budget when the default network
+changes; waking resumes any retry budget that was merely paused by Doze, and
+**Connect** can retry immediately.
 
 To produce a signed release build, provide these environment variables before
 running `./gradlew assembleRelease`:

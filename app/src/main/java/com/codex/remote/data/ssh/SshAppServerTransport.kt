@@ -12,6 +12,8 @@ import net.schmizz.sshj.DefaultSecurityProviderConfig
 import net.schmizz.sshj.common.Buffer
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
+import net.schmizz.keepalive.KeepAliveProvider
+import net.schmizz.keepalive.KeepAliveRunner
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.Closeable
@@ -44,6 +46,14 @@ internal class TransportAbortPlan(
     }
 }
 
+internal class TransportCloseGate {
+    private val started = AtomicBoolean(false)
+
+    fun run(block: () -> Unit) {
+        if (started.compareAndSet(false, true)) block()
+    }
+}
+
 class ActiveSshTransport internal constructor(
     private val ssh: SSHClient,
     private val session: Session,
@@ -55,7 +65,7 @@ class ActiveSshTransport internal constructor(
     private val inbound = command.inputStream
     private val outbound = command.outputStream
     private val errorInbound = command.errorStream
-    private val aborted = AtomicBoolean(false)
+    private val closeGate = TransportCloseGate()
 
     val reader: BufferedReader = BufferedReader(InputStreamReader(inbound, Charsets.UTF_8))
     val writer: BufferedWriter = BufferedWriter(OutputStreamWriter(outbound, Charsets.UTF_8))
@@ -77,20 +87,17 @@ class ActiveSshTransport internal constructor(
     )
 
     fun abort() {
-        aborted.set(true)
-        abortPlan.run()
+        closeGate.run(abortPlan::run)
     }
 
     override fun close() {
-        if (aborted.get()) {
-            abortPlan.run()
-            return
+        closeGate.run {
+            runCatching { writer.close() }
+            runCatching { command.close() }
+            runCatching { session.close() }
+            runCatching { ssh.disconnect() }
+            runCatching { ssh.close() }
         }
-        runCatching { writer.close() }
-        runCatching { command.close() }
-        runCatching { session.close() }
-        runCatching { ssh.disconnect() }
-        runCatching { ssh.close() }
     }
 }
 
@@ -277,8 +284,13 @@ internal fun androidCompatibleSshConfig() = DefaultSecurityProviderConfig().appl
     keyExchangeFactories = keyExchangeFactories.filterNot {
         it.name.contains("curve25519", ignoreCase = true)
     }
+    keepAliveProvider = KeepAliveProvider.KEEP_ALIVE
 }
 
 internal fun configureProtocolKeepAlive(ssh: SSHClient) {
-    ssh.connection.keepAlive.keepAliveInterval = 30
+    ssh.connection.keepAlive.keepAliveInterval = KEEP_ALIVE_INTERVAL_SECONDS
+    (ssh.connection.keepAlive as? KeepAliveRunner)?.maxAliveCount = KEEP_ALIVE_MAX_UNANSWERED
 }
+
+private const val KEEP_ALIVE_INTERVAL_SECONDS = 15
+private const val KEEP_ALIVE_MAX_UNANSWERED = 3

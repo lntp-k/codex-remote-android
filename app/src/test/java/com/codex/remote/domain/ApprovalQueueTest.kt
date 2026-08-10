@@ -49,6 +49,16 @@ class ApprovalQueueTest {
     }
 
     @Test
+    fun serverResolutionMustMatchBothTheWireRequestAndOwningThread() {
+        val request = approval("request-1", "git status").copy(threadId = "thread-a")
+        val queued = ApprovalQueue().enqueue(request)
+        val requestId = RpcRequestId.Text("request-1")
+
+        assertSame(queued, queued.complete("thread-b", requestId))
+        assertEquals(emptyList<ApprovalRequest>(), queued.complete("thread-a", requestId).requests)
+    }
+
+    @Test
     fun staleOrDuplicateUiCallbacksNeverFallBackToTheCurrentRequest() {
         val beforeCompletion = ApprovalQueue()
             .enqueue(approval("request-1", "git status"))

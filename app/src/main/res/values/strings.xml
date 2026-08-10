@@ -1,3 +1,9 @@
 <resources>
     <string name="app_name">Codex Remote</string>
+    <string name="ssh_connection_notification_channel">Remote connection</string>
+    <string name="ssh_connection_notification_channel_description">Keeps the active SSH connection available while Codex Remote is in the background.</string>
+    <string name="ssh_connection_notification_title">Codex Remote is connected</string>
+    <string name="ssh_connection_notification_text">Keeping the SSH session available in the background</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="ssh_connection_fgs_subtype">Maintains a user-requested SSH connection to a remote Codex session while the app is not visible.</string>
 </resources>

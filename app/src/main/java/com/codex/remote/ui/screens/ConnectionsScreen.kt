@@ -134,7 +134,11 @@ fun ConnectionsScreen(
                         ConnectionRow(
                             connection = connection,
                             isActive = state.activeConnection?.id == connection.id,
-                            isConnecting = state.activeConnection?.id == connection.id && state.connectionStatus == ConnectionStatus.CONNECTING,
+                            isConnecting = state.activeConnection?.id == connection.id &&
+                                state.connectionStatus in setOf(
+                                    ConnectionStatus.CONNECTING,
+                                    ConnectionStatus.RECONNECTING,
+                                ),
                             onConnect = { onConnect(connection) },
                             onEdit = { onEdit(connection) },
                             onDelete = { pendingDelete = connection },
