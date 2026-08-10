@@ -1,6 +1,6 @@
 # Architecture
 
-## Current implementation boundary (2026-08-08)
+## Current implementation boundary (2026-08-10)
 
 The direct Android-to-SSH topology remains unchanged. The current branch adds
 the Paseo-inspired **multi-session state foundation**, not a relay, Android
@@ -15,16 +15,20 @@ Implemented in this branch:
 - connection-, selection-, load-, and turn-start-owned asynchronous results;
 - per-task session indicators; and
 - a global sequential approval surface with exact owner context and
-  fail-closed background approval behavior.
+  fail-closed background approval behavior;
+- a process-wide connection owner anchored by a user-visible foreground
+  service; and
+- default-network monitoring with safe-boundary SSH/app-server handoff
+  and remote task reconciliation.
 
 Not yet established by this implementation:
 
 - a complete multi-session dashboard or grouped approval inbox;
-- Android process-recreation persistence or remote task persistence;
+- durable remote execution after the SSH app-server process itself exits;
 - Workspace/worktree lifecycle, terminal sessions, or rich Git mutation UI;
-- actual device upgrade/data-preservation compatibility (the signed `0.1.7`
-  candidate has the same package and signer as `0.1.6` and a higher version
-  code, so the static upgrade prerequisites are established); or
+- actual device upgrade/data-preservation compatibility (the signed `0.1.8`
+  candidate has the same package and signer as `0.1.7`/`0.1.6` and a higher
+  version code, so the static upgrade prerequisites are established); or
 - physical-device, Android instrumentation runtime, and real SSH smoke proof.
 
 ## Source audit
@@ -52,7 +56,8 @@ an agent on Android.
 ```text
 Android UI
    |
-   | SSH handshake (verify/pin SHA-256 host key)
+   | foreground-service-owned lifetime
+   | default-network callback + SSH handshake (verify/pin SHA-256 host key)
    v
 Remote login shell
    |
@@ -79,6 +84,75 @@ JSONL transport over SSH stdin/stdout
 
 Agent execution, repository access, authentication, tools and approvals remain
 owned by the remote Codex installation. Android has no local agent runtime.
+
+## Background lifetime and network recovery
+
+`CodexRemoteApplication` owns the single process-wide `AppViewModel`, while
+`SshConnectionService` keeps the user-requested connection visible and active
+when no Activity is on screen. The service uses the `specialUse` foreground
+service type because connections may target arbitrary SSH hosts rather than a
+single local-device category. Its persistent notification opens the app and
+offers an explicit Disconnect action.
+
+`ConnectivityManager.registerDefaultNetworkCallback` tracks Android's current
+default network without requiring `NET_CAPABILITY_VALIDATED`; this avoids
+filtering out private/VPN routes such as Tailscale. A guarded delayed snapshot
+handles a cold offline start without allowing a stale snapshot to overwrite a
+newer callback. A dial also records its `activeNetwork` handle, so the initial
+callback or a resubscription callback does not cause a duplicate SSH bootstrap
+when it reports the same route.
+
+An established TCP socket cannot migrate to a new default network. After a
+500 ms debounce, a genuinely changed route therefore requires a fresh
+SSH/app-server connection. If any turn or approval is active, one polling job
+defers the handoff until that protected work reaches a safe boundary. Other
+pending RPCs receive a five-second completion grace; if the grace expires the
+client reconnects without replaying the operation and tells the user to verify
+its result. New turns, reviews, and forks are temporarily rejected while a
+handoff is pending. A responding approval whose delivery becomes ambiguous
+still fails closed rather than being replayed.
+
+When no replacement default network exists, the current transport is left open
+until it fails, but new reconnect dials wait for network availability. SSHJ's
+reply-checked protocol keepalive runs every 15 seconds and treats three
+unanswered requests as a lost connection, so a black-holed old route eventually
+reaches the normal transport-failure recovery path without semantic health RPCs.
+Because Android Doze suspends network access even for an active foreground
+service, `ACTION_DEVICE_IDLE_MODE_CHANGED` pauses scheduled dials without
+spending the retry budget and performs an immediate recovery check after wake.
+
+Transport failures retry after 1/2/4/8/16/30-second capped delays. Timers canceled
+by callback churn do not consume the retry budget; only actual SSH dials count,
+automatic dialing pauses after ten consecutive attempts, and the counter resets
+after a 30-second stable connection. The foreground monitor and exact desired
+connection marker remain active at the circuit breaker, so a new default-network
+identity resets the budget and makes one immediate recovery attempt. Device wake
+resumes a budget that Doze paused, but does not reset an already-open circuit
+breaker. Generation checks prevent late failures or stale timers from replacing
+a newer healthy connection.
+
+The requested connection ID is committed before the foreground service starts,
+so `START_STICKY` process recreation restores the exact intended host rather
+than whichever host was last used successfully. Explicit Disconnect and terminal
+failures clear that intent. A missing/corrupt target removes the foreground
+notification and stops with `START_NOT_STICKY` instead of leaving an orphan
+service. SSH shutdown is detached on the main thread and closed on an I/O scope
+to avoid blocking the Android UI on a dead route.
+
+Reconnect always creates a new SSH process and app-server protocol session,
+reruns initialization and host-key verification, reloads remote threads, and
+resumes the previously selected thread from remote truth. It does not replay an
+in-flight user message or approval. If transport loss made connected work
+ambiguous, the restored UI explicitly asks the user to verify the remote result.
+Host-key, authentication, remote setup,
+protocol-identity, ownership, and ambiguous approval-delivery failures suspend
+automatic recovery and require explicit user action.
+
+This is logical session recovery, not TCP migration or durable remote
+execution. Android may still stop the app through force-stop/Task Manager, and
+a tunnel transition can terminate the SSH-bound app-server (including an
+in-flight turn). True uninterrupted remote work still requires the separately
+gated persistent daemon/relay design described in Phase 4 of the handoff.
 
 ## Session state and exact event routing
 

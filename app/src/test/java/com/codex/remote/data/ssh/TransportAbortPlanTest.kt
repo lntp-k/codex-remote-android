@@ -3,6 +3,10 @@ package com.codex.remote.data.ssh
 import java.io.BufferedWriter
 import java.io.IOException
 import java.io.Writer
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -51,5 +55,30 @@ class TransportAbortPlanTest {
 
         assertEquals(listOf("command", "session", "reader", "writer", "tail"), attempts)
         assertEquals("", transmitted.toString())
+    }
+
+    @Test
+    fun transportCloseGateRunsCleanupExactlyOnceAcrossConcurrentCallers() {
+        val gate = TransportCloseGate()
+        val startsTogether = CountDownLatch(1)
+        val completed = CountDownLatch(8)
+        val cleanupCount = AtomicInteger(0)
+        val executor = Executors.newFixedThreadPool(8)
+
+        repeat(8) {
+            executor.execute {
+                startsTogether.await()
+                gate.run { cleanupCount.incrementAndGet() }
+                completed.countDown()
+            }
+        }
+        startsTogether.countDown()
+
+        try {
+            assertEquals(true, completed.await(5, TimeUnit.SECONDS))
+            assertEquals(1, cleanupCount.get())
+        } finally {
+            executor.shutdownNow()
+        }
     }
 }

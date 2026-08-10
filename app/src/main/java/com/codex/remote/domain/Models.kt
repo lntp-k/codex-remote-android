@@ -877,7 +877,7 @@ data class ApprovalQueue(
     }
 }
 
-enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
+enum class ConnectionStatus { DISCONNECTED, CONNECTING, RECONNECTING, CONNECTED, ERROR }
 
 data class ThreadSessionIndicator(
     val isRunning: Boolean = false,

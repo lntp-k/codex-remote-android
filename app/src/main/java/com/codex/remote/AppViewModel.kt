@@ -1,13 +1,33 @@
 package com.codex.remote
 
 import android.app.Application
+import android.net.ConnectivityManager
+import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.codex.remote.data.rpc.AppServerEvent
 import com.codex.remote.data.rpc.CodexRpcClient
+import com.codex.remote.data.rpc.FailureKind
+import com.codex.remote.data.rpc.RpcException
+import com.codex.remote.data.ssh.HostKeyChangedException
+import com.codex.remote.data.ssh.RemoteCodexUnavailableException
 import com.codex.remote.data.ssh.SshAppServerTransportFactory
 import com.codex.remote.data.ssh.UnknownHostKeyException
 import com.codex.remote.data.store.ConnectionStore
+import com.codex.remote.connection.ConnectionMaintenanceStore
+import com.codex.remote.connection.NetworkHandoffDisposition
+import com.codex.remote.connection.NetworkRecoveryAction
+import com.codex.remote.connection.NetworkTransition
+import com.codex.remote.connection.NetworkTransitionTracker
+import com.codex.remote.connection.ReconnectAttemptLedger
+import com.codex.remote.connection.ReconnectReadiness
+import com.codex.remote.connection.SshConnectionService
+import com.codex.remote.connection.availableNetworkRequiresHandoff
+import com.codex.remote.connection.networkHandoffDisposition
+import com.codex.remote.connection.reconnectReadiness
+import com.codex.remote.connection.networkRecoveryAction
 import com.codex.remote.domain.AppUiState
 import com.codex.remote.domain.ApprovalFileItemKey
 import com.codex.remote.domain.ApprovalQueue
@@ -53,10 +73,13 @@ import com.codex.remote.session.TurnStartToken
 import com.codex.remote.session.TurnStartResponseDisposition
 import com.codex.remote.session.retainedCharacterCount
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -66,18 +89,39 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.io.IOException
 import java.util.UUID
+import net.schmizz.sshj.common.DisconnectReason
+import net.schmizz.sshj.common.SSHException
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val store = ConnectionStore(application)
+    private val maintenanceStore = ConnectionMaintenanceStore(application)
+    private val connectivityManager = application.getSystemService(ConnectivityManager::class.java)
+    private val powerManager = application.getSystemService(PowerManager::class.java)
     private val transportFactory = SshAppServerTransportFactory(application)
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
+    private val transportCleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var rpc: CodexRpcClient? = null
     private var eventJob: Job? = null
+    private var connectionJob: Job? = null
+    private var reconnectJob: Job? = null
+    private var reconnectStabilityJob: Job? = null
+    private var networkHandoffJob: Job? = null
     private var sessionRegistry = SessionRegistry()
     private val sessionRequestTracker = SessionRequestTracker()
+    private val reconnectAttempts = ReconnectAttemptLedger()
+    private val networkTransitions = NetworkTransitionTracker()
+    private var shouldMaintainConnection = false
+    private var hasObservedNetworkState = false
+    private var networkHandoffPending = false
+    private var activeConnectionAttemptNetworkId: Long? = null
+    private var reconnectHadUnconfirmedWork = false
+    private var reconnectCircuitBreakerPaused = false
+    private var isDeviceIdleMode = powerManager.isDeviceIdleMode
+    private var pendingReconnectSelection: ReconnectSelection? = null
     private var didRestoreLastConnection = false
     // Keep response flush/completion and inbound approval enqueue in one order so a wire ID
     // cannot be reused against an entry that is still locally outstanding.
@@ -89,7 +133,19 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val sortedConnections = connections.sortedByDescending { it.lastUsedAt }
                 val connectionToRestore = if (!didRestoreLastConnection) {
                     didRestoreLastConnection = true
-                    sortedConnections.lastUsedConnectionOrNull()
+                    val desiredConnectionId = maintenanceStore.desiredConnectionId()
+                    sortedConnections.desiredConnectionOrNull(desiredConnectionId).also { desired ->
+                        if (desiredConnectionId != null) {
+                            if (desired == null) {
+                                val cleared = maintenanceStore.clear()
+                                Log.e(
+                                    CONNECTION_LOG_TAG,
+                                    "state=maintenance_target_missing clear_persisted=$cleared",
+                                )
+                                SshConnectionService.stop(getApplication())
+                            }
+                        }
+                    }
                 } else {
                     null
                 }
@@ -152,15 +208,119 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connect(connection: SavedConnection) {
-        viewModelScope.launch {
-            disconnectInternal(clearActive = false)
+        didRestoreLastConnection = true
+        if (!maintenanceStore.remember(connection.id)) {
+            Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_persist_failed")
+            _state.update { current ->
+                if (
+                    current.activeConnection != null &&
+                    current.connectionStatus != ConnectionStatus.DISCONNECTED &&
+                    current.connectionStatus != ConnectionStatus.ERROR
+                ) {
+                    current.copy(notice = "Could not save the new background connection target; the current connection was kept.")
+                } else {
+                    current.copy(
+                        activeConnection = connection,
+                        connectionStatus = ConnectionStatus.ERROR,
+                        connectionMessage = "Could not persist the background connection target. Tap Connect to retry.",
+                        showConnections = true,
+                        notice = "Connection paused because its recovery target could not be saved.",
+                    )
+                }
+            }
+            return
+        }
+        reconnectJob?.cancel()
+        reconnectJob = null
+        val currentDefaultNetworkId = runCatching {
+            connectivityManager.activeNetwork?.networkHandle
+        }.getOrNull()
+        networkTransitions.reset(currentDefaultNetworkId)
+        hasObservedNetworkState = true
+        activeConnectionAttemptNetworkId = currentDefaultNetworkId
+        reconnectAttempts.reset()
+        reconnectCircuitBreakerPaused = false
+        pendingReconnectSelection = null
+        networkHandoffPending = false
+        networkHandoffJob?.cancel()
+        networkHandoffJob = null
+        shouldMaintainConnection = true
+        if (!SshConnectionService.start(getApplication())) {
+            shouldMaintainConnection = false
+            if (!maintenanceStore.clear()) {
+                Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed reason=fgs_start")
+            }
+            disconnectInternal(clearActive = true)
+            _state.update {
+                it.copy(
+                    activeConnection = connection,
+                    connectionStatus = ConnectionStatus.ERROR,
+                    connectionMessage = "Android blocked background connection startup. Open Codex Remote and tap Connect again.",
+                    showConnections = true,
+                    notice = "Connection paused because Android could not start its foreground service.",
+                )
+            }
+            return
+        }
+        when (
+            reconnectReadiness(
+                isDeviceIdleMode = isDeviceIdleMode,
+                hasObservedNetworkState = hasObservedNetworkState,
+                hasAvailableNetwork = networkTransitions.hasAvailableNetwork,
+            )
+        ) {
+            ReconnectReadiness.WAITING_FOR_DEVICE_WAKE -> {
+                _state.update {
+                    it.copy(
+                        activeConnection = connection,
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for the device to wake…",
+                        showConnections = false,
+                    )
+                }
+                return
+            }
+            ReconnectReadiness.WAITING_FOR_NETWORK -> {
+                _state.update {
+                    it.copy(
+                        activeConnection = connection,
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for a network…",
+                        showConnections = false,
+                    )
+                }
+                return
+            }
+            ReconnectReadiness.READY -> Unit
+        }
+        startConnectionAttempt(connection, isReconnect = false)
+    }
+
+    private fun startConnectionAttempt(connection: SavedConnection, isReconnect: Boolean) {
+        connectionJob = viewModelScope.launch {
+            networkHandoffPending = false
+            networkHandoffJob?.cancel()
+            networkHandoffJob = null
+            val attemptNetworkId = runCatching {
+                connectivityManager.activeNetwork?.networkHandle
+            }.getOrNull()
+            activeConnectionAttemptNetworkId = attemptNetworkId
+            disconnectInternal(clearActive = false, suspendMaintenance = false)
             val connectionEpoch = sessionRequestTracker.connectionGeneration
             var attemptClient: CodexRpcClient? = null
             _state.update {
                 it.copy(
                     activeConnection = connection,
-                    connectionStatus = ConnectionStatus.CONNECTING,
-                    connectionMessage = "Connecting to ${connection.host}…",
+                    connectionStatus = if (isReconnect) {
+                        ConnectionStatus.RECONNECTING
+                    } else {
+                        ConnectionStatus.CONNECTING
+                    },
+                    connectionMessage = if (isReconnect) {
+                        "Reconnecting to ${connection.host}…"
+                    } else {
+                        "Connecting to ${connection.host}…"
+                    },
                     showConnections = false,
                     timeline = emptyList(),
                     olderHistoryCursor = null,
@@ -208,7 +368,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     isStatusLoading = false,
                     statusError = null,
                     pendingHostKeyFingerprint = null,
-                    notice = null,
+                    notice = if (isReconnect) it.notice else null,
                 )
             }
             runCatching {
@@ -216,7 +376,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val transport = transportFactory.open(connection, secrets)
                 val client = CodexRpcClient(transport)
                 if (sessionRequestTracker.connectionGeneration != connectionEpoch) {
-                    client.close()
+                    closeClientInBackground(client)
                     throw SupersededConnectionException()
                 }
                 attemptClient = client
@@ -243,6 +403,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 val projects = groupThreadsByProject(bootstrap.threads)
                 val selectedModel = bootstrap.models.firstOrNull { model -> model.isDefault }
                     ?: bootstrap.models.firstOrNull()
+                val reconnectSelection = pendingReconnectSelection
+                val hadUnconfirmedWork = reconnectHadUnconfirmedWork
+                val selectedProjectPath = reconnectSelection?.projectPath
+                    ?.takeIf { path -> projects.any { it.path == path } }
+                    ?: projects.firstOrNull()?.path
+                val connectedNetworkChanged = networkTransitions.currentNetworkId
+                    ?.let { currentNetworkId -> currentNetworkId != attemptNetworkId }
+                    ?: false
+                val needsImmediateNetworkHandoff = networkHandoffPending || connectedNetworkChanged
                 _state.update {
                     it.copy(
                         connectionStatus = ConnectionStatus.CONNECTED,
@@ -270,24 +439,58 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         plugins = emptyList(),
                         isComposerCatalogLoading = true,
                         composerCatalogError = null,
-                        selectedProjectPath = projects.firstOrNull()?.path,
+                        selectedProjectPath = selectedProjectPath,
+                        showConnections = false,
+                        notice = when {
+                            needsImmediateNetworkHandoff -> {
+                                "Network changed while connecting; reopening SSH on the current route."
+                            }
+                            !isReconnect -> it.notice
+                            hadUnconfirmedWork -> {
+                                "Connection restored; verify the operation that was in flight while the connection was interrupted."
+                            }
+                            else -> "Connection restored"
+                        },
                     )
                 }
+                if (needsImmediateNetworkHandoff) {
+                    requestNetworkHandoff(connection)
+                    return@onSuccess
+                }
+                reconnectStabilityJob?.cancel()
+                if (isReconnect) {
+                    reconnectStabilityJob = viewModelScope.launch {
+                        delay(RECONNECT_STABILITY_WINDOW_MILLIS)
+                        if (rpc === attemptClient && _state.value.connectionStatus == ConnectionStatus.CONNECTED) {
+                            reconnectAttempts.reset()
+                            Log.i(CONNECTION_LOG_TAG, "state=stable reconnect_attempt_reset=true")
+                        }
+                    }
+                } else {
+                    reconnectAttempts.reset()
+                }
+                pendingReconnectSelection = null
+                reconnectHadUnconfirmedWork = false
+                reconnectCircuitBreakerPaused = false
                 refreshComposerCatalog()
+                reconnectSelection?.threadId
+                    ?.let { threadId -> bootstrap.threads.firstOrNull { it.id == threadId } }
+                    ?.let(::selectThread)
             }.onFailure { error ->
                 if (error.isCancellation()) return@onFailure
                 if (sessionRequestTracker.connectionGeneration != connectionEpoch || rpc !== attemptClient) {
-                    attemptClient?.close()
+                    closeClientInBackground(attemptClient)
                     return@onFailure
                 }
                 eventJob?.cancel()
                 eventJob = null
-                rpc?.close()
+                closeClientInBackground(rpc)
                 rpc = null
                 val unknownHostKey = generateSequence(error) { it.cause }
                     .filterIsInstance<UnknownHostKeyException>()
                     .firstOrNull()
                 if (unknownHostKey != null) {
+                    suspendConnectionMaintenance()
                     _state.update {
                         it.copy(
                             connectionStatus = ConnectionStatus.ERROR,
@@ -295,7 +498,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             pendingHostKeyFingerprint = unknownHostKey.fingerprint,
                         )
                     }
+                } else if (error.isRetryableConnectionFailure() && shouldMaintainConnection) {
+                    scheduleReconnect(friendlyError(error))
                 } else {
+                    suspendConnectionMaintenance()
                     _state.update {
                         it.copy(
                             connectionStatus = ConnectionStatus.ERROR,
@@ -334,17 +540,390 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() {
-        viewModelScope.launch { disconnectInternal(clearActive = true) }
+        didRestoreLastConnection = true
+        viewModelScope.launch {
+            disconnectInternal(clearActive = true)
+        }
     }
 
-    private fun disconnectInternal(clearActive: Boolean) {
+    fun onDefaultNetworkAvailable(networkId: Long) {
+        viewModelScope.launch {
+            hasObservedNetworkState = true
+            val transition = networkTransitions.onAvailable(networkId)
+            val connection = _state.value.activeConnection ?: return@launch
+            if (!shouldMaintainConnection) return@launch
+            if (isDeviceIdleMode) {
+                Log.i(CONNECTION_LOG_TAG, "state=network_available recovery_deferred=device_idle")
+                return@launch
+            }
+            val availableNetworkMayRequireHandoff = when (transition) {
+                NetworkTransition.CHANGED,
+                NetworkTransition.RESTORED,
+                NetworkTransition.INITIAL -> availableNetworkRequiresHandoff(
+                    activeConnectionAttemptNetworkId,
+                    networkId,
+                )
+                NetworkTransition.UNCHANGED,
+                NetworkTransition.LOST,
+                NetworkTransition.STALE_LOSS -> false
+            }
+            if (availableNetworkMayRequireHandoff && connectionJob?.isActive == true) {
+                networkHandoffPending = true
+                Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=connection_attempt")
+            }
+            val recoveryAction = if (
+                transition == NetworkTransition.INITIAL &&
+                _state.value.connectionStatus == ConnectionStatus.CONNECTED &&
+                availableNetworkMayRequireHandoff
+            ) {
+                NetworkRecoveryAction.REQUEST_HANDOFF
+            } else {
+                networkRecoveryAction(
+                    transition = transition,
+                    connectionStatus = _state.value.connectionStatus,
+                    connectionAttemptActive = connectionJob?.isActive == true,
+                )
+            }.let { action ->
+                if (action == NetworkRecoveryAction.REQUEST_HANDOFF && !availableNetworkMayRequireHandoff) {
+                    NetworkRecoveryAction.NONE
+                } else {
+                    action
+                }
+            }
+            when (recoveryAction) {
+                NetworkRecoveryAction.REQUEST_HANDOFF -> {
+                    requestNetworkHandoff(connection)
+                }
+                NetworkRecoveryAction.SCHEDULE_RECONNECT -> {
+                    if (reconnectCircuitBreakerPaused) {
+                        reconnectAttempts.reset()
+                        reconnectCircuitBreakerPaused = false
+                        Log.i(CONNECTION_LOG_TAG, "state=reconnect_circuit_breaker_reset reason=network_change")
+                    }
+                    scheduleReconnect(
+                        message = "Network available; restoring the SSH session",
+                        immediate = true,
+                        connection = connection,
+                    )
+                }
+                NetworkRecoveryAction.NONE -> Unit
+            }
+        }
+    }
+
+    fun onDefaultNetworkUnavailable() {
+        viewModelScope.launch {
+            hasObservedNetworkState = true
+            networkTransitions.onUnavailable()
+            if (!shouldMaintainConnection) return@launch
+            networkHandoffJob?.cancel()
+            networkHandoffJob = null
+            networkHandoffPending = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            if (_state.value.connectionStatus == ConnectionStatus.RECONNECTING) {
+                _state.update { it.copy(connectionMessage = "Waiting for a network…") }
+            }
+            Log.i(CONNECTION_LOG_TAG, "state=network_unavailable")
+        }
+    }
+
+    fun onDeviceIdleModeChanged(isIdle: Boolean) {
+        viewModelScope.launch {
+            if (isDeviceIdleMode == isIdle) return@launch
+            isDeviceIdleMode = isIdle
+            if (!shouldMaintainConnection) return@launch
+            if (isIdle) {
+                reconnectJob?.cancel()
+                reconnectJob = null
+                networkHandoffJob?.cancel()
+                networkHandoffJob = null
+                if (_state.value.connectionStatus == ConnectionStatus.RECONNECTING) {
+                    _state.update {
+                        it.copy(
+                            connectionMessage = "Waiting for the device to wake…",
+                            showConnections = false,
+                        )
+                    }
+                }
+                Log.i(CONNECTION_LOG_TAG, "state=device_idle reconnect_deferred=true")
+                return@launch
+            }
+
+            val connection = _state.value.activeConnection ?: return@launch
+            val currentNetworkId = networkTransitions.currentNetworkId
+            if (_state.value.connectionStatus == ConnectionStatus.CONNECTED) {
+                if (
+                    currentNetworkId != null &&
+                    availableNetworkRequiresHandoff(activeConnectionAttemptNetworkId, currentNetworkId)
+                ) {
+                    requestNetworkHandoff(connection)
+                } else {
+                    networkHandoffPending = false
+                }
+            } else if (
+                _state.value.connectionStatus != ConnectionStatus.CONNECTED &&
+                connectionJob?.isActive != true &&
+                (!hasObservedNetworkState || networkTransitions.hasAvailableNetwork)
+            ) {
+                scheduleReconnect(
+                    message = "Device awake; restoring the SSH session",
+                    immediate = true,
+                    connection = connection,
+                )
+            }
+            Log.i(CONNECTION_LOG_TAG, "state=device_awake recovery_checked=true")
+        }
+    }
+
+    private fun requestNetworkHandoff(connection: SavedConnection) {
+        if (!shouldMaintainConnection || _state.value.activeConnection?.id != connection.id) return
+        networkHandoffPending = true
+        networkHandoffJob?.cancel()
+        networkHandoffJob = viewModelScope.launch {
+            delay(NETWORK_CHANGE_DEBOUNCE_MILLIS)
+            var deferWasLogged = false
+            var pendingRpcSinceMillis: Long? = null
+            while (
+                networkHandoffPending &&
+                shouldMaintainConnection &&
+                _state.value.activeConnection?.id == connection.id &&
+                _state.value.connectionStatus == ConnectionStatus.CONNECTED
+            ) {
+                val hasRunningTurn = hasRunningTurn()
+                val hasPendingApproval = hasPendingApproval()
+                val hasPendingRpc = rpc?.hasPendingRequests() == true
+                when {
+                    !hasRunningTurn && !hasPendingApproval && !hasPendingRpc -> {
+                        performNetworkHandoffIfSafe(connection)
+                        return@launch
+                    }
+                    hasRunningTurn || hasPendingApproval -> pendingRpcSinceMillis = null
+                    else -> {
+                        val now = SystemClock.elapsedRealtime()
+                        val since = pendingRpcSinceMillis ?: now.also { pendingRpcSinceMillis = it }
+                        if (now - since >= NETWORK_PENDING_RPC_GRACE_MILLIS) {
+                            reconnectHadUnconfirmedWork = true
+                            performNetworkHandoffIfSafe(connection, allowPendingRpc = true)
+                            return@launch
+                        }
+                    }
+                }
+                if (!deferWasLogged) {
+                    Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
+                    deferWasLogged = true
+                }
+                delay(NETWORK_HANDOFF_RECHECK_MILLIS)
+            }
+        }
+    }
+
+    private fun performNetworkHandoffIfSafe(
+        connection: SavedConnection,
+        allowPendingRpc: Boolean = false,
+    ) {
+        if (
+            !networkHandoffPending ||
+            !shouldMaintainConnection ||
+            _state.value.activeConnection?.id != connection.id ||
+            _state.value.connectionStatus != ConnectionStatus.CONNECTED
+        ) {
+            return
+        }
+        val hasRunningTurn = hasRunningTurn()
+        val hasPendingApproval = hasPendingApproval()
+        val hasPendingRpc = rpc?.hasPendingRequests() == true
+        val canOverridePendingRpc = allowPendingRpc &&
+            !hasRunningTurn &&
+            !hasPendingApproval &&
+            hasPendingRpc
+        if (
+            currentNetworkHandoffDisposition() == NetworkHandoffDisposition.DEFER &&
+            !canOverridePendingRpc
+        ) {
+            Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
+            return
+        }
+        if (suspendForAmbiguousApprovalDelivery()) return
+        networkHandoffPending = false
+        networkHandoffJob = null
+        rememberSelectionForReconnect()
+        disconnectInternal(clearActive = false, suspendMaintenance = false)
+        scheduleReconnect(
+            message = "Network changed; opening SSH on the new route",
+            immediate = true,
+            connection = connection,
+        )
+    }
+
+    private fun currentNetworkHandoffDisposition(): NetworkHandoffDisposition {
+        val hasRunningTurn = hasRunningTurn()
+        val hasPendingApproval = hasPendingApproval()
+        val hasPendingRpc = rpc?.hasPendingRequests() == true
+        return networkHandoffDisposition(hasRunningTurn, hasPendingApproval, hasPendingRpc)
+    }
+
+    private fun hasRunningTurn(): Boolean = _state.value.isTurnRunning ||
+        sessionRegistry.sessions.values.any { it.isTurnRunning }
+
+    private fun hasPendingApproval(): Boolean = sessionRegistry.sessions.values.any {
+        it.approvalQueue.entries.isNotEmpty() || it.approvalQueue.respondingKeys.isNotEmpty()
+    }
+
+    private fun disconnectInternal(clearActive: Boolean, suspendMaintenance: Boolean = true) {
+        if (suspendMaintenance) suspendConnectionMaintenance()
+        reconnectStabilityJob?.cancel()
+        reconnectStabilityJob = null
         sessionRequestTracker.invalidateConnection()
         eventJob?.cancel()
         eventJob = null
-        rpc?.close()
+        val detachedClient = rpc
         rpc = null
+        closeClientInBackground(detachedClient)
         sessionRegistry = SessionRegistry()
         _state.update { it.afterDisconnect(clearActive) }
+    }
+
+    private fun suspendConnectionMaintenance() {
+        shouldMaintainConnection = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectStabilityJob?.cancel()
+        reconnectStabilityJob = null
+        networkHandoffJob?.cancel()
+        networkHandoffJob = null
+        networkHandoffPending = false
+        reconnectHadUnconfirmedWork = false
+        reconnectCircuitBreakerPaused = false
+        reconnectAttempts.reset()
+        pendingReconnectSelection = null
+        if (!maintenanceStore.clear()) {
+            Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed")
+        }
+        SshConnectionService.stop(getApplication())
+    }
+
+    private fun rememberSelectionForReconnect() {
+        if (pendingReconnectSelection != null) return
+        val snapshot = _state.value
+        pendingReconnectSelection = ReconnectSelection(
+            projectPath = snapshot.selectedProjectPath,
+            threadId = snapshot.selectedThreadId,
+        )
+    }
+
+    private fun suspendForAmbiguousApprovalDelivery(): Boolean {
+        val responseInFlight = sessionRegistry.sessions.values.any { session ->
+            session.approvalQueue.respondingKeys.isNotEmpty()
+        }
+        if (!responseInFlight) return false
+        val message = "Approval response delivery could not be confirmed; disconnected without retrying."
+        disconnectInternal(clearActive = false)
+        _state.update {
+            it.copy(
+                connectionStatus = ConnectionStatus.ERROR,
+                connectionMessage = message,
+                showConnections = true,
+                notice = message,
+            )
+        }
+        Log.w(CONNECTION_LOG_TAG, "state=suspended reason=approval_delivery_ambiguous")
+        return true
+    }
+
+    private fun scheduleReconnect(
+        message: String,
+        immediate: Boolean = false,
+        connection: SavedConnection? = _state.value.activeConnection,
+    ) {
+        val target = connection ?: return
+        if (!shouldMaintainConnection || _state.value.activeConnection?.id != target.id) return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        when (
+            reconnectReadiness(
+                isDeviceIdleMode = isDeviceIdleMode,
+                hasObservedNetworkState = hasObservedNetworkState,
+                hasAvailableNetwork = networkTransitions.hasAvailableNetwork,
+            )
+        ) {
+            ReconnectReadiness.WAITING_FOR_DEVICE_WAKE -> {
+                _state.update {
+                    it.copy(
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for the device to wake…",
+                        showConnections = false,
+                        notice = message,
+                    )
+                }
+                Log.i(CONNECTION_LOG_TAG, "state=waiting_for_device_wake reason=retry_requested")
+                return
+            }
+            ReconnectReadiness.WAITING_FOR_NETWORK -> {
+                _state.update {
+                    it.copy(
+                        connectionStatus = ConnectionStatus.RECONNECTING,
+                        connectionMessage = "Waiting for a network…",
+                        showConnections = false,
+                        notice = message,
+                    )
+                }
+                Log.i(CONNECTION_LOG_TAG, "state=waiting_for_network reason=retry_requested")
+                return
+            }
+            ReconnectReadiness.READY -> Unit
+        }
+        val attempt = reconnectAttempts.startedAttempts
+        if (!reconnectAttempts.canSchedule()) {
+            val pausedMessage =
+                "Automatic reconnect paused after ${reconnectAttempts.maximumAttempts} failed attempts. It will retry after a network change, or you can tap Connect."
+            reconnectCircuitBreakerPaused = true
+            _state.update {
+                it.copy(
+                    connectionStatus = ConnectionStatus.ERROR,
+                    connectionMessage = pausedMessage,
+                    showConnections = true,
+                    notice = pausedMessage,
+                )
+            }
+            Log.w(CONNECTION_LOG_TAG, "state=suspended reason=reconnect_circuit_breaker")
+            return
+        }
+        val delayMillis = if (immediate) {
+            NETWORK_CHANGE_DEBOUNCE_MILLIS
+        } else {
+            reconnectAttempts.delayMillisForNextAttempt()
+        }
+        val scheduledConnectionGeneration = sessionRequestTracker.connectionGeneration
+        _state.update {
+            it.copy(
+                connectionStatus = ConnectionStatus.RECONNECTING,
+                connectionMessage = "Reconnecting in ${delayMillis / 1_000.0}s…",
+                showConnections = false,
+                notice = message,
+            )
+        }
+        Log.i(
+            CONNECTION_LOG_TAG,
+            "state=reconnect_scheduled attempt=$attempt delay_ms=$delayMillis",
+        )
+        reconnectJob = viewModelScope.launch {
+            delay(delayMillis)
+            if (
+                !shouldMaintainConnection ||
+                _state.value.activeConnection?.id != target.id ||
+                _state.value.connectionStatus == ConnectionStatus.CONNECTED ||
+                connectionJob?.isActive == true ||
+                isDeviceIdleMode ||
+                sessionRequestTracker.connectionGeneration != scheduledConnectionGeneration
+            ) {
+                Log.i(CONNECTION_LOG_TAG, "state=reconnect_skipped reason=stale_timer")
+                return@launch
+            }
+            if (!reconnectAttempts.markStarted(attempt)) return@launch
+            Log.i(CONNECTION_LOG_TAG, "state=reconnect_started attempt=$attempt")
+            startConnectionAttempt(target, isReconnect = true)
+        }
     }
 
     fun newThread() {
@@ -701,6 +1280,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         attachments: List<ComposerImageAttachment> = emptyList(),
         asGoal: Boolean = false,
     ) {
+        if (rejectNewWorkDuringNetworkHandoff()) return
         val prompt = text.trim()
         if (prompt.isEmpty() && attachments.isEmpty()) return
         if (_state.value.activeConnection == null) return
@@ -1172,6 +1752,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun forkThread() {
+        if (rejectNewWorkDuringNetworkHandoff()) return
         val client = rpc ?: return
         val connectionGeneration = sessionRequestTracker.connectionGeneration
         val snapshot = _state.value
@@ -1283,6 +1864,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startReview(targetKind: ReviewTargetKind, targetValue: String = "") {
+        if (rejectNewWorkDuringNetworkHandoff()) return
         val client = rpc ?: return
         val connectionGeneration = sessionRequestTracker.connectionGeneration
         val snapshot = _state.value
@@ -1932,6 +2514,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.withSessionRegistry(registry) }
     }
 
+    private fun rejectNewWorkDuringNetworkHandoff(): Boolean {
+        if (!networkHandoffPending) return false
+        _state.update {
+            it.copy(notice = "Network route changed; wait for SSH reconnection before starting new work.")
+        }
+        return true
+    }
+
     private fun applySessionMutation(
         mutation: SessionRegistryMutation,
         failureNotice: String,
@@ -2043,8 +2633,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     is AppServerEvent.Approval -> approvalFlowMutex.withLock {
                         routeSessionEvent(client, connectionGeneration, event)
                     }
-                    is AppServerEvent.ApprovalResolved -> approvalFlowMutex.withLock {
-                        routeSessionEvent(client, connectionGeneration, event)
+                    is AppServerEvent.ApprovalResolved -> {
+                        approvalFlowMutex.withLock {
+                            routeSessionEvent(client, connectionGeneration, event)
+                        }
                     }
                     AppServerEvent.AccountChanged -> refreshRemoteAccount()
                     is AppServerEvent.ThreadStarted -> {
@@ -2114,13 +2706,31 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         val message = friendlyError(IllegalStateException(event.message))
                         if (event.threadId == null) {
                             if (rpc === client) {
-                                disconnectInternal(clearActive = false)
-                                _state.update { it.afterGlobalAppServerFailure(message) }
+                                if (event.kind == FailureKind.TRANSPORT && shouldMaintainConnection) {
+                                    val hadUnconfirmedWork =
+                                        (_state.value.connectionStatus == ConnectionStatus.CONNECTED &&
+                                            event.hadPendingRequests) ||
+                                        hasRunningTurn() ||
+                                        hasPendingApproval()
+                                    if (suspendForAmbiguousApprovalDelivery()) return@collect
+                                    if (hadUnconfirmedWork) {
+                                        reconnectHadUnconfirmedWork = true
+                                        Log.w(
+                                            CONNECTION_LOG_TAG,
+                                            "state=transport_interrupted in_flight_work_unconfirmed=true",
+                                        )
+                                    }
+                                    rememberSelectionForReconnect()
+                                    disconnectInternal(clearActive = false, suspendMaintenance = false)
+                                    scheduleReconnect(message)
+                                } else {
+                                    disconnectInternal(clearActive = false)
+                                    _state.update { it.afterGlobalAppServerFailure(message) }
+                                }
                             }
                         } else {
-                            if (routeSessionEvent(client, connectionGeneration, event) &&
-                                _state.value.selectedThreadId == event.threadId
-                            ) {
+                            val applied = routeSessionEvent(client, connectionGeneration, event)
+                            if (applied && _state.value.selectedThreadId == event.threadId) {
                                 _state.update { state -> state.copy(notice = message) }
                             }
                         }
@@ -2387,8 +2997,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.update { it.copy(isBusy = false, notice = friendlyError(error)) }
     }
 
+    private fun closeClientInBackground(client: CodexRpcClient?) {
+        if (client == null) return
+        client.beginClose()
+        transportCleanupScope.launch {
+            runCatching { client.close() }
+        }
+    }
+
     override fun onCleared() {
-        rpc?.close()
+        val detachedClient = rpc
+        rpc = null
+        closeClientInBackground(detachedClient)
         super.onCleared()
     }
 }
@@ -2527,12 +3147,77 @@ private data class ConnectionBootstrap(
     val permissionProfiles: List<com.codex.remote.domain.RemotePermissionProfile>,
 )
 
+private data class ReconnectSelection(
+    val projectPath: String?,
+    val threadId: String?,
+)
+
 private class SupersededConnectionException : Exception("Connection attempt was superseded")
 
 private fun Throwable.isCancellation(): Boolean =
     generateSequence(this) { it.cause }.any {
         it is CancellationException && it !is TimeoutCancellationException
     }
+
+internal fun Throwable.isRetryableConnectionFailure(): Boolean {
+    val causes = generateSequence(this) { it.cause }.toList()
+    if (causes.any {
+            it is UnknownHostKeyException ||
+                it is HostKeyChangedException ||
+                it is RemoteCodexUnavailableException ||
+                it is SecurityException
+        }
+    ) {
+        return false
+    }
+    if (causes.any { cause ->
+            val type = cause::class.java.simpleName.lowercase()
+            val message = cause.message.orEmpty().lowercase()
+            type.contains("userauth") ||
+                message.contains("authentication") ||
+                message.contains("auth fail") ||
+                message.contains("permission denied") ||
+                message.contains("private key") ||
+                message.contains("password")
+        }
+    ) {
+        return false
+    }
+    causes.filterIsInstance<SSHException>().forEach { error ->
+        when (error.disconnectReason) {
+            DisconnectReason.CONNECTION_LOST -> return true
+            DisconnectReason.UNKNOWN -> Unit
+            else -> return false
+        }
+    }
+    if (causes.any { cause ->
+            val message = cause.message.orEmpty().lowercase()
+            message.contains("protocol error") ||
+                message.contains("protocol version") ||
+                message.contains("key exchange") ||
+                message.contains("algorithm negotiation") ||
+                message.contains("no matching") ||
+                message.contains("mac error") ||
+                message.contains("host key")
+        }
+    ) {
+        return false
+    }
+    if (causes.any { it is IOException || it is TimeoutCancellationException }) {
+        return true
+    }
+    return causes.any { cause ->
+        val message = cause.message.orEmpty().lowercase()
+        cause is RpcException && message.contains("connection closed") ||
+            message.contains("connection reset") ||
+            message.contains("broken pipe") ||
+            message.contains("timed out") ||
+            message.contains("timeout") ||
+            message.contains("network is unreachable") ||
+            message.contains("no route to host") ||
+            message.contains("stream was interrupted")
+    }
+}
 
 internal fun AppUiState.afterGlobalAppServerFailure(message: String): AppUiState =
     afterDisconnect(clearActive = false).copy(
@@ -2599,6 +3284,11 @@ internal fun AppUiState.afterDisconnect(clearActive: Boolean): AppUiState = copy
 private const val SAFE_PERMISSION_PROFILE = ":workspace"
 private const val SAFE_APPROVAL_POLICY = "on-request"
 private const val SAFE_APPROVALS_REVIEWER = "user"
+private const val NETWORK_CHANGE_DEBOUNCE_MILLIS = 500L
+private const val NETWORK_HANDOFF_RECHECK_MILLIS = 1_000L
+private const val NETWORK_PENDING_RPC_GRACE_MILLIS = 5_000L
+private const val RECONNECT_STABILITY_WINDOW_MILLIS = 30_000L
+private const val CONNECTION_LOG_TAG = "CodexRemoteConnection"
 
 private fun SessionSettings.safeAuthorizationOrDefault(): SessionSettings {
     val profile = permissionProfile?.takeIf(String::isNotBlank)
@@ -2678,6 +3368,9 @@ internal fun Map<ApprovalFileItemKey, TimelineItem>.recordFileApprovalItem(
 
 internal fun List<SavedConnection>.lastUsedConnectionOrNull(): SavedConnection? =
     maxByOrNull(SavedConnection::lastUsedAt)?.takeIf { it.lastUsedAt > 0 }
+
+internal fun List<SavedConnection>.desiredConnectionOrNull(desiredConnectionId: String?): SavedConnection? =
+    desiredConnectionId?.let { desiredId -> firstOrNull { it.id == desiredId } }
 
 internal fun Throwable.isUnsupportedRpcMethod(method: String): Boolean =
     generateSequence(this) { it.cause }.any { error ->

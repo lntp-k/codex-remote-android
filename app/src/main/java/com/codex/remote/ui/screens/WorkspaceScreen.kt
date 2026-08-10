@@ -945,6 +945,13 @@ private fun WorkspaceContent(
                 loading = true,
                 modifier = Modifier.fillMaxSize().padding(padding),
             )
+            ConnectionStatus.RECONNECTING -> ConnectionState(
+                icon = null,
+                title = "Restoring connection",
+                detail = state.connectionMessage,
+                loading = true,
+                modifier = Modifier.fillMaxSize().padding(padding),
+            )
             ConnectionStatus.ERROR -> ConnectionState(
                 icon = Icons.Outlined.ErrorOutline,
                 title = "Connection failed",

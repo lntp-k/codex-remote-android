@@ -137,6 +137,40 @@ The retained `0.1.6` APK was not modified. The Dropbox remote reported the
 uploaded object at 3,614,820 bytes; a read-back SHA-256 matched the build
 output.
 
+## Signed `0.1.8` background-recovery candidate
+
+Updated: 2026-08-10 (Asia/Seoul)
+
+This candidate adds process-wide foreground connection ownership,
+default-network handoff, Doze-aware retry suspension, exact desired-target
+restoration, bounded reconnect, and fail-closed handling for ambiguous work.
+It remains a QA candidate rather than a device-validated production release.
+
+| Check | Status / evidence |
+| --- | --- |
+| Version | `0.1.8` / `versionCode = 9` |
+| JVM unit tests | 249 tests; 0 failures, 0 errors, 0 skipped |
+| Lint | 0 errors, 22 non-blocking warnings |
+| Debug and Android-test APK assembly | Passed |
+| Signed minified release assembly | Passed, including release lint-vital and R8 |
+| Signed release APK | 3,632,216 bytes; SHA-256 `7a4fe4c3ee1aa58c619974265ed2f0b4bef5a34986fb84d182ec8061db7bf118` |
+| Signature | APK Signature Scheme v2 passed; one RSA-4096 signer |
+| Signer continuity | Certificate SHA-256 `253257e7a3f4a1175b5eed656470e764efad2072252442cee617f99bb2bd1d20`, exact match to `0.1.7` and `0.1.6` |
+| Package metadata | `com.codex.remote`; compile/target/min SDK `36` / `36` / `26` |
+| 16 KiB ZIP alignment | All stored 64-bit native-library data offsets are divisible by 16,384; 32-bit offsets are divisible by 4,096 |
+| Native ELF alignment | Every 64-bit native-library `PT_LOAD` segment has `p_align = 0x4000` |
+| Independent source review | Two lifecycle/network reviews found no remaining release-blocking source defect |
+
+The following copies were read back as byte-identical:
+
+- `/home/jl/coding/codex-remote-android/codex-remote-android-v0.1.8.apk`
+- `/home/jl/mnt/dropbox-personal/codex-remote-android-v0.1.8.apk`
+
+The previous `0.1.7` candidate was retained unchanged. No usable ADB-connected
+phone was present, so overwrite installation, saved-connection preservation,
+Samsung background/forced-Doze behavior, actual SSH, approval interruption,
+and Wi-Fi/cellular/Tailscale transitions remain device-validation gates.
+
 ## Device and runtime validation -- not performed
 
 - [ ] Android 14 / API 34 physical device or emulator.

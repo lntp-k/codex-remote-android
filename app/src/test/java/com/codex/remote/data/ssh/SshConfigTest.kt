@@ -1,6 +1,8 @@
 package com.codex.remote.data.ssh
 
 import com.codex.remote.domain.RemotePlatform
+import net.schmizz.keepalive.KeepAliveProvider
+import net.schmizz.keepalive.KeepAliveRunner
 import net.schmizz.sshj.SSHClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,13 +11,16 @@ import org.junit.Test
 
 class SshConfigTest {
     @Test
-    fun configuresProtocolKeepAliveEveryThirtySeconds() {
+    fun configuresReplyCheckedProtocolKeepAliveForDeadRouteDetection() {
         val ssh = SSHClient(androidCompatibleSshConfig())
 
         try {
             configureProtocolKeepAlive(ssh)
 
-            assertEquals(30, ssh.connection.keepAlive.keepAliveInterval)
+            assertEquals(KeepAliveProvider.KEEP_ALIVE, androidCompatibleSshConfig().keepAliveProvider)
+            assertTrue(ssh.connection.keepAlive is KeepAliveRunner)
+            assertEquals(15, ssh.connection.keepAlive.keepAliveInterval)
+            assertEquals(3, (ssh.connection.keepAlive as KeepAliveRunner).maxAliveCount)
         } finally {
             runCatching { ssh.close() }
         }

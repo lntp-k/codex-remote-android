@@ -1,13 +1,13 @@
 # Codex Remote: Paseo-inspired features and Android SDK handoff
 
-- Status: Phase 0 automated migration and Phase 1 implemented; Phase 2a partial
+- Status: Phase 0/1 implemented; Phase 2a partial; Phase 4 Android recovery implemented
 - Prepared: 2026-08-06 (Asia/Seoul)
 - Repository: `lntp-k/codex-remote-android`
 - Baseline commit: `c2b5e60fecc37bb8d95c52d082da06031f87187c`
 - Baseline release: `0.1.6` (`versionCode = 7`)
 - Implementation branch: `agent/paseo-android16-session-registry`
-- Current committed verification tip before `0.1.7` release metadata: `e794d9e`
-  (`Document and verify Android multi-session migration`)
+- Pre-`0.1.8` source parent: `dbf1aae`
+  (`Prepare signed Android 0.1.7 release candidate`)
 
 ## 0. 한국어 요약
 
@@ -25,11 +25,14 @@
    캐시·히스토리의 개별/합계 보존 한도를 구현했다.
 4. 사이드바 세션 상태 표시와 전역 순차 승인 표시를 추가했다. 다른
    세션의 승인은 소유 작업을 열기 전에는 허용할 수 없고 거부만 가능하다.
+5. `0.1.8`에서는 Application 범위 연결 소유자, 사용자 표시 foreground
+   service, default-network handoff, Doze 대기, 제한된 자동 재접속과 원격
+   상태 재조회를 구현했다. 메시지와 승인 응답은 자동 재생하지 않는다.
 
 아직 완성되지 않은 다음 단계는 완전한 멀티 세션 대시보드/통합 승인함,
-명시적 Workspace·worktree, 지속 실행/복구, 터미널, 풍부한 Git 검토이다.
-서명된 `0.1.7` QA 후보와 기존 `0.1.6`의 서명자 일치는 확인했다. 다만
-실제 `0.1.6` 위 업그레이드와 연결정보 보존, 실제 Android 기기, 실제
+명시적 Workspace·worktree, 원격 프로세스 지속 실행, 터미널, 풍부한 Git
+검토이다. 서명된 `0.1.8` QA 후보와 기존 `0.1.7`/`0.1.6`의 서명자 일치는
+확인했다. 다만 실제 이전 버전 위 업그레이드와 연결정보 보존, Android 기기, 실제
 SSH, Android instrumentation 런타임 검증은 완료되지 않았다. 현재 자동
 검증 산출물과 최종 clean build 수치는
 `docs/verification/ANDROID_16_MIGRATION.md`에 기록한다.
@@ -68,12 +71,13 @@ complexity.
 
 | Scope | Status | Evidence boundary |
 | --- | --- | --- |
-| Phase 0B: AGP 8.13.2 / Gradle 8.13 / JDK 17 | Implemented | Final local ARM64 clean gate passed: 212 JVM tests, lint, three APK builds, R8 mapping, integrity/signature/alignment checks. |
+| Phase 0B: AGP 8.13.2 / Gradle 8.13 / JDK 17 | Implemented | Local ARM64 gate passed: 249 JVM tests, lint, debug/test/release APK builds, signature and alignment checks. |
 | Phase 0C: compile against API 36 | Implemented | `compileSdk = 36`; no physical-device claim. |
 | Phase 0D: target API 36 | Implemented in source | `targetSdk = 36`; Android 14/15/16 behavior and upgrade installation remain unverified. |
 | Phase 1: per-session state and exact event routing | Implemented | JVM routing, bounds, ownership, parsing, projection, and request-race regressions exist. |
 | Phase 2a: visible supervision | Partial | Per-thread indicators and one global sequential approval surface exist; no full dashboard, grouped inbox, notification deep link, or process-recreation claim. |
-| Phases 3-7 | Not implemented | Workspace/worktree, persistence, terminal, rich Git review, and optional integrations remain roadmap items. |
+| Phase 4: Android connection recovery | Implemented on Android | Foreground lifetime, network handoff, Doze-aware retry, exact target restore, fail-closed ambiguity handling; no remote durable daemon. |
+| Phases 3, 5-7 | Not implemented | Workspace/worktree, remote persistence, terminal, rich Git review, and optional integrations remain roadmap items. |
 
 "Implemented" in this table means source plus automated checks, not a shipped
 or device-validated release. The unsigned CI release artifact is deliberately
@@ -457,6 +461,18 @@ Acceptance criteria:
 This phase has a decision gate; do not select a persistence mechanism based on
 convenience alone.
 
+Android-side recovery landed in `0.1.8`: an active connection is anchored by a
+foreground service, genuine default-network changes trigger a fresh SSH handoff
+after turns and approvals reach a safe boundary, and transport loss reconnects
+with capped backoff while reloading the selected remote task. Other pending RPCs
+receive a bounded completion grace and are never replayed. Doze and offline
+periods pause dialing without consuming attempts; a network change or wake can
+resume a Doze-paused connection, while only a network identity change or manual
+Connect resets the circuit breaker. The foreground monitor and exact desired
+target remain present while automatic dialing is paused. The remote-persistence
+decision gate below remains open; the Android recovery layer does not keep an
+SSH-bound app-server or in-flight turn alive after that remote process exits.
+
 Evaluation order:
 
 1. Verify whether the installed Codex app-server daemon provides a supported,
@@ -698,7 +714,7 @@ without recording its complete version and digest.
 | 6 | `0.1.7` release metadata + signed candidate evidence | Verified 2026-08-08; device promotion pending | Device-validation claims |
 | 7 | Complete multi-session dashboard + grouped approval inbox | Partial Phase 2a only | Worktree mutations |
 | 8 | Workspace registry + safe worktree operations | Pending | Persistent terminal |
-| 9 | Connection supervisor/persistence | Pending | Rich Git review |
+| 9 | Android connection supervisor | Implemented in `0.1.8`; remote persistence pending | Rich Git review |
 | 10 | PTY/tmux terminal | Pending | Generic command API |
 | 11 | Rich Git review | Pending | Unrelated provider integrations |
 

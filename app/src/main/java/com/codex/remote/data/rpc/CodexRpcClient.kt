@@ -139,11 +139,15 @@ sealed interface AppServerEvent {
         } else {
             FailureTurnIdStatus.EXACT
         },
+        val kind: FailureKind = FailureKind.REMOTE,
+        val hadPendingRequests: Boolean = false,
     ) : AppServerEvent
     data class FatalProtocolError(val message: String) : AppServerEvent
     data class Warning(val message: String) : AppServerEvent
     data class Diagnostic(val message: String) : AppServerEvent
 }
+
+enum class FailureKind { REMOTE, TRANSPORT }
 
 class RpcException(message: String, val code: Int? = null) : Exception(message)
 
@@ -342,6 +346,8 @@ class CodexRpcClient(
     private val _events = MutableSharedFlow<AppServerEvent>(extraBufferCapacity = 128)
     val events: SharedFlow<AppServerEvent> = _events
     private var readerJob: Job? = null
+
+    internal fun hasPendingRequests(): Boolean = pending.isNotEmpty()
 
     suspend fun initialize(): RemoteServerInfo {
         readerJob = scope.launch { readLoop() }
@@ -830,10 +836,12 @@ class CodexRpcClient(
     }
 
     suspend fun request(method: String, params: JsonObject = buildJsonObject {}): JsonObject {
+        if (protocolTerminationStarted.get()) throw RpcException("Remote connection is closed")
         val id = RpcRequestId.Number(requestId.getAndIncrement())
         val deferred = CompletableDeferred<JsonObject>()
         pending[id] = deferred
         try {
+            if (protocolTerminationStarted.get()) throw RpcException("Remote connection is closed")
             send(buildJsonObject {
                 put("method", method)
                 put("id", id.value)
@@ -853,6 +861,7 @@ class CodexRpcClient(
     private suspend fun respond(id: RpcRequestId, result: JsonObject) = send(responseEnvelope(id, result))
 
     private suspend fun send(message: JsonObject) = writeMutex.withLock {
+        if (protocolTerminationStarted.get()) throw RpcException("Remote connection is closed")
         withContext(Dispatchers.IO) {
             transport.writer.write(json.encodeToString(JsonObject.serializer(), message))
             transport.writer.newLine()
@@ -922,17 +931,25 @@ class CodexRpcClient(
                 }
             }
             if (!protocolTerminationStarted.get()) {
+                val hadPendingRequests = pending.isNotEmpty()
                 outstandingApprovalRequests.invalidate()
                 transport.abort()
-                _events.emit(AppServerEvent.Failure("Remote app-server disconnected"))
+                _events.emit(
+                    AppServerEvent.Failure(
+                        message = "Remote app-server disconnected",
+                        kind = FailureKind.TRANSPORT,
+                        hadPendingRequests = hadPendingRequests,
+                    ),
+                )
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
             if (!protocolTerminationStarted.get()) {
+                val hadPendingRequests = pending.isNotEmpty()
                 outstandingApprovalRequests.invalidate()
                 transport.abort()
-                _events.emit(AppServerEvent.Failure(error.message ?: "SSH data stream was interrupted"))
+                _events.emit(appServerReaderFailureEvent(error, hadPendingRequests))
             }
         } finally {
             val error = RpcException("Remote connection closed")
@@ -1827,10 +1844,37 @@ class CodexRpcClient(
         }
     }
 
-    override fun close() {
+    internal fun beginClose() {
+        protocolTerminationStarted.set(true)
+        outstandingApprovalRequests.invalidate()
         readerJob?.cancel()
         scope.cancel()
+        val error = RpcException("Remote connection closed")
+        pending.values.forEach { it.completeExceptionally(error) }
+        pending.clear()
+    }
+
+    override fun close() {
+        beginClose()
         transport.close()
+    }
+}
+
+internal fun appServerReaderFailureEvent(
+    error: Throwable,
+    hadPendingRequests: Boolean = false,
+): AppServerEvent {
+    val isTransportInterruption = generateSequence(error) { it.cause }.any { it is IOException }
+    return if (isTransportInterruption) {
+        AppServerEvent.Failure(
+            message = error.message ?: "SSH data stream was interrupted",
+            kind = FailureKind.TRANSPORT,
+            hadPendingRequests = hadPendingRequests,
+        )
+    } else {
+        AppServerEvent.FatalProtocolError(
+            "Remote app-server reader failed safely; disconnected without automatic retry.",
+        )
     }
 }
 
