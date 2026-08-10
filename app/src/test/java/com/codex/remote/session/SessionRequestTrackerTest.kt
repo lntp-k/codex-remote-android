@@ -195,4 +195,45 @@ class SessionRequestTrackerTest {
             tracker.resolveTurnStartResponse(start, "turn-a"),
         )
     }
+
+    @Test
+    fun sharedDaemonStartDoesNotClaimAnUncorrelatedDesktopTurn() {
+        val tracker = SessionRequestTracker()
+        tracker.invalidateConnection()
+        val start = tracker.beginTurnStart("thread-a", clientUserMessageId = "local-phone")
+
+        assertTrue(tracker.observeTurnStarted("thread-a", "turn-desktop"))
+        tracker.observeTurnCompleted("thread-a", "turn-desktop")
+
+        assertTrue(tracker.canRollbackTurnStart(start))
+    }
+
+    @Test
+    fun matchingClientUserMessageClaimsThePhoneTurnExactly() {
+        val tracker = SessionRequestTracker()
+        tracker.invalidateConnection()
+        val start = tracker.beginTurnStart("thread-a", clientUserMessageId = "local-phone")
+
+        assertTrue(tracker.observeTurnStarted("thread-a", "turn-phone"))
+        assertTrue(tracker.observeUserMessage("thread-a", "turn-phone", "desktop-message"))
+        assertTrue(tracker.observeUserMessage("thread-a", "turn-phone", "local-phone"))
+        assertEquals(
+            TurnStartResponseDisposition.ALREADY_OBSERVED,
+            tracker.resolveTurnStartResponse(start, "turn-phone"),
+        )
+        assertFalse(tracker.canRollbackTurnStart(start))
+    }
+
+    @Test
+    fun matchingClientUserMessageCannotChangeAnOwnedTurnId() {
+        val tracker = SessionRequestTracker()
+        tracker.invalidateConnection()
+        val start = tracker.beginTurnStart("thread-a", clientUserMessageId = "local-phone")
+
+        assertEquals(
+            TurnStartResponseDisposition.APPLY,
+            tracker.resolveTurnStartResponse(start, "turn-phone"),
+        )
+        assertFalse(tracker.observeUserMessage("thread-a", "turn-other", "local-phone"))
+    }
 }

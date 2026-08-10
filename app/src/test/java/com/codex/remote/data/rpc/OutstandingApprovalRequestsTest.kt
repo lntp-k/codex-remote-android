@@ -81,6 +81,97 @@ class OutstandingApprovalRequestsTest {
     }
 
     @Test
+    fun exactSharedDaemonReplayIsIdempotentAndResolvesOnce() = runTest {
+        val requests = OutstandingApprovalRequests()
+        val id = RpcRequestId.Text("approval-shared-replay")
+        val params = commandApprovalParams("git status")
+
+        assertTrue(
+            trackedServerRequestEvent(
+                requests,
+                id,
+                "item/commandExecution/requestApproval",
+                params,
+            ) is AppServerEvent.Approval,
+        )
+        assertEquals(
+            null,
+            trackedServerRequestEvent(
+                requests,
+                id,
+                "item/commandExecution/requestApproval",
+                params,
+            ),
+        )
+
+        requests.respondAndTrackUntilResolved(id) {}
+        assertTrue(requests.resolve(id, "thread-shared"))
+        assertTrue(requests.reserve(id))
+    }
+
+    @Test
+    fun exactReplayDuringResponseFlushDoesNotReopenOrInvalidateTheApproval() = runTest {
+        val requests = OutstandingApprovalRequests()
+        val id = RpcRequestId.Text("approval-shared-flush")
+        val params = commandApprovalParams("git diff")
+        val sendStarted = CompletableDeferred<Unit>()
+        val allowFlushToComplete = CompletableDeferred<Unit>()
+        assertTrue(
+            trackedServerRequestEvent(
+                requests,
+                id,
+                "item/commandExecution/requestApproval",
+                params,
+            ) is AppServerEvent.Approval,
+        )
+
+        val response = async {
+            requests.respondAndTrackUntilResolved(id) {
+                sendStarted.complete(Unit)
+                allowFlushToComplete.await()
+            }
+        }
+        sendStarted.await()
+
+        assertEquals(
+            null,
+            trackedServerRequestEvent(
+                requests,
+                id,
+                "item/commandExecution/requestApproval",
+                params,
+            ),
+        )
+        allowFlushToComplete.complete(Unit)
+        response.await()
+        assertTrue(requests.resolve(id, "thread-shared"))
+    }
+
+    @Test
+    fun changedAuthorizationContextUnderAReplayedIdFailsClosed() {
+        val requests = OutstandingApprovalRequests()
+        val id = RpcRequestId.Text("approval-shared-conflict")
+        assertTrue(
+            trackedServerRequestEvent(
+                requests,
+                id,
+                "item/commandExecution/requestApproval",
+                commandApprovalParams("git status"),
+            ) is AppServerEvent.Approval,
+        )
+
+        val conflict = trackedServerRequestEvent(
+            requests,
+            id,
+            "item/commandExecution/requestApproval",
+            commandApprovalParams("git push"),
+        )
+
+        assertTrue(conflict is AppServerEvent.FatalProtocolError)
+        assertFalse(requests.reserve(RpcRequestId.Text("approval-later")))
+    }
+
+    @Test
     fun sameIdCanBeReusedOnlyAfterTheServerResolutionArrives() = runTest {
         val requests = OutstandingApprovalRequests()
         val id = RpcRequestId.Number(7)
@@ -203,7 +294,7 @@ class OutstandingApprovalRequestsTest {
     }
 
     @Test
-    fun trackedResolutionReleasesTheRequestAndRejectsUnexpectedIds() {
+    fun trackedResolutionReleasesTheRequestAndIgnoresAWellFormedUnknownId() {
         val requests = OutstandingApprovalRequests()
         val id = RpcRequestId.Text("approval-resolved")
         assertTrue(requests.reserve(id, "thread-1"))
@@ -219,14 +310,87 @@ class OutstandingApprovalRequestsTest {
         assertEquals(AppServerEvent.ApprovalResolved("thread-1", id), event)
         assertTrue(requests.reserve(id))
 
+        val racingRequests = OutstandingApprovalRequests()
         val unexpected = trackedServerRequestResolvedEvent(
-            OutstandingApprovalRequests(),
+            racingRequests,
             buildJsonObject {
                 put("threadId", "thread-1")
                 put("requestId", "missing")
             },
         )
-        assertTrue(unexpected is AppServerEvent.FatalProtocolError)
+        assertEquals(null, unexpected)
+        assertTrue(racingRequests.reserve(RpcRequestId.Text("approval-after-race"), "thread-2"))
+    }
+
+    @Test
+    fun resolutionBeforeResumeReplaySuppressesEveryStaleClone() {
+        val requests = OutstandingApprovalRequests()
+        val id = RpcRequestId.Text("approval-resume-race")
+        val resolution = buildJsonObject {
+            put("threadId", "thread-shared")
+            put("requestId", "approval-resume-race")
+        }
+        val params = commandApprovalParams("git status")
+
+        assertEquals(null, trackedServerRequestResolvedEvent(requests, resolution))
+        assertEquals(
+            null,
+            trackedServerRequestEvent(requests, id, "item/commandExecution/requestApproval", params),
+        )
+        assertEquals(
+            null,
+            trackedServerRequestEvent(requests, id, "item/commandExecution/requestApproval", params),
+        )
+        assertTrue(
+            trackedServerRequestEvent(
+                requests,
+                RpcRequestId.Text("approval-next"),
+                "item/commandExecution/requestApproval",
+                params,
+            ) is AppServerEvent.Approval,
+        )
+    }
+
+    @Test
+    fun staleReplayWithAChangedThreadFailsClosedAgainstTheResolutionTombstone() {
+        val requests = OutstandingApprovalRequests()
+        val id = RpcRequestId.Text("approval-resume-owner")
+        assertEquals(
+            null,
+            trackedServerRequestResolvedEvent(
+                requests,
+                buildJsonObject {
+                    put("threadId", "thread-shared")
+                    put("requestId", "approval-resume-owner")
+                },
+            ),
+        )
+
+        val changedOwner = trackedServerRequestEvent(
+            requests,
+            id,
+            "item/commandExecution/requestApproval",
+            commandApprovalParams("git status", threadId = "thread-other"),
+        )
+
+        assertTrue(changedOwner is AppServerEvent.FatalProtocolError)
+        assertFalse(requests.reserve(RpcRequestId.Text("approval-later")))
+    }
+
+    @Test
+    fun malformedUnknownResolutionStillFailsClosed() {
+        val requests = OutstandingApprovalRequests()
+
+        val malformed = trackedServerRequestResolvedEvent(
+            requests,
+            buildJsonObject {
+                put("threadId", "thread-1")
+                put("requestId", buildJsonObject { put("invalid", true) })
+            },
+        )
+
+        assertTrue(malformed is AppServerEvent.FatalProtocolError)
+        assertFalse(requests.reserve(RpcRequestId.Text("approval-later")))
     }
 
     @Test
@@ -269,5 +433,14 @@ class OutstandingApprovalRequestsTest {
         } catch (error: RpcException) {
             assertTrue(error.message!!.contains("request id", ignoreCase = true))
         }
+    }
+
+    private fun commandApprovalParams(command: String, threadId: String = "thread-shared") = buildJsonObject {
+        put("threadId", threadId)
+        put("turnId", "turn-shared")
+        put("itemId", "command-shared")
+        put("startedAtMs", 1L)
+        put("command", command)
+        put("cwd", "/srv/app")
     }
 }

@@ -113,11 +113,37 @@ class WorkspaceDeviceTest {
         composeRule.onNodeWithText("Auto review").assertIsDisplayed().performClick()
         composeRule.runOnIdle { assertEquals(PermissionMode.AUTO_REVIEW, callbacks.permissionMode) }
 
+        composeRule.onNodeWithTag(COMPOSER_PERMISSIONS).performClick()
+        composeRule.onNodeWithText("Full access for this task").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("any files accessible to the remote account", substring = true)
+            .assertIsDisplayed()
+        composeRule.runOnIdle { assertEquals(PermissionMode.AUTO_REVIEW, callbacks.permissionMode) }
+        composeRule.onNodeWithText("Cancel").performClick()
+        composeRule.runOnIdle { assertEquals(PermissionMode.AUTO_REVIEW, callbacks.permissionMode) }
+
+        composeRule.onNodeWithTag(COMPOSER_PERMISSIONS).performClick()
+        composeRule.onNodeWithText("Full access for this task").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Enable full access").performClick()
+        composeRule.runOnIdle { assertEquals(PermissionMode.FULL_ACCESS, callbacks.permissionMode) }
+
         composeRule.onNodeWithTag(COMPOSER_INPUT).performTextInput("/plan")
         composeRule.onNodeWithTag(COMPOSER_SEND).performClick()
         composeRule.runOnIdle { assertEquals("plan", callbacks.collaborationMode) }
         composeRule.onAllNodesWithText("Default", substring = true).assertCountEquals(0)
         composeRule.onAllNodesWithText("Plan mode", substring = true).assertCountEquals(0)
+    }
+
+    @Test
+    fun fullAccessConfirmationDefersAChangeWhileTheCurrentTurnIsRunning() {
+        val callbacks = WorkspaceCallbacks()
+        show(mutableStateOf(baseState(isTurnRunning = true)), callbacks)
+
+        composeRule.onNodeWithTag(COMPOSER_PERMISSIONS).performClick()
+        composeRule.onNodeWithText("Full access for this task").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("applies from the next turn", substring = true).assertIsDisplayed()
+        composeRule.runOnIdle { assertEquals(null, callbacks.permissionMode) }
+        composeRule.onNodeWithText("Cancel").performClick()
+        composeRule.runOnIdle { assertEquals(null, callbacks.permissionMode) }
     }
 
     @Test
@@ -529,7 +555,7 @@ val answer = 42
                 ApprovalContextField("Additional permissions", "{\"network\":{\"enabled\":true}}"),
             ),
             threadId = "thread-a",
-            availableDecisions = listOf("accept", "decline"),
+            availableDecisions = listOf("accept", "acceptForSession", "decline"),
         )
         val second = first.copy(
             requestId = RpcRequestId.Text("request-later"),
@@ -545,7 +571,7 @@ val answer = 42
         composeRule.onNodeWithText("Working directory").assertIsDisplayed()
         composeRule.onNodeWithText("/workspace/secure-command").assertIsDisplayed()
         composeRule.onNodeWithText("{\"network\":{\"enabled\":true}}", substring = true).assertIsDisplayed()
-        composeRule.onAllNodesWithText("Allow session").assertCountEquals(0)
+        composeRule.onNodeWithText("Allow commands for session").assertIsDisplayed()
         composeRule.onNodeWithText("Allow once").performClick()
 
         composeRule.runOnIdle {
@@ -795,7 +821,7 @@ val answer = 42
         )
 
         composeRule.onNodeWithText("Allow once").assertIsNotEnabled()
-        composeRule.onNodeWithText("Allow session").assertIsNotEnabled()
+        composeRule.onNodeWithText("Allow file changes for session").assertIsNotEnabled()
         composeRule.onNodeWithText("additional file target hidden", substring = true).assertIsDisplayed()
         composeRule.onNodeWithText("app/generated/File201.kt").assertDoesNotExist()
     }

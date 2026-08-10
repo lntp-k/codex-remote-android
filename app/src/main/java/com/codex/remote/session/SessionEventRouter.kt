@@ -278,17 +278,23 @@ internal object SessionEventRouter {
             session.timeline.indexOfLast { existing ->
                 existing.id.startsWith("local-") &&
                     existing.kind == TimelineKind.USER &&
-                    existing.body == event.item.body
+                    event.item.clientId != null &&
+                    existing.id == event.item.clientId
             }
         } else {
             -1
         }
-        val timeline = if (index < 0 && localUserIndex >= 0) {
-            session.timeline.toMutableList().also { it[localUserIndex] = event.item }
-        } else if (index < 0) {
-            session.timeline + event.item
-        } else {
-            session.timeline.toMutableList().also { it[index] = event.item }
+        val timeline = session.timeline.toMutableList().also { updated ->
+            when {
+                index >= 0 -> {
+                    updated[index] = event.item
+                    if (localUserIndex >= 0 && localUserIndex != index) {
+                        updated.removeAt(localUserIndex)
+                    }
+                }
+                localUserIndex >= 0 -> updated[localUserIndex] = event.item
+                else -> updated += event.item
+            }
         }
         return applyTimeline(registry, session, timeline) { updated ->
             updated.copy(

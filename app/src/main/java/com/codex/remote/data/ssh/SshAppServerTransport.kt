@@ -1,12 +1,19 @@
 package com.codex.remote.data.ssh
 
 import android.content.Context
+import com.codex.remote.data.transport.AppServerMessageChannel
+import com.codex.remote.data.transport.JsonLineAppServerMessageChannel
+import com.codex.remote.data.transport.WebSocketAppServerMessageChannel
 import com.codex.remote.domain.AuthType
 import com.codex.remote.domain.ConnectionSecrets
 import com.codex.remote.domain.RemotePlatform
 import com.codex.remote.domain.SavedConnection
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.DefaultSecurityProviderConfig
 import net.schmizz.sshj.common.Buffer
@@ -15,11 +22,9 @@ import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.keepalive.KeepAliveProvider
 import net.schmizz.keepalive.KeepAliveRunner
 import java.io.BufferedReader
-import java.io.BufferedWriter
 import java.io.Closeable
 import java.io.File
 import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.security.MessageDigest
 import java.security.PublicKey
 import java.util.Base64
@@ -35,6 +40,17 @@ class UnknownHostKeyException(val fingerprint: String) :
     SecurityException("Confirm the SSH host fingerprint before connecting: $fingerprint")
 
 class RemoteCodexUnavailableException(message: String) : IllegalStateException(message)
+
+internal enum class AppServerConnectionMode {
+    SHARED_DAEMON,
+    ISOLATED_STDIO,
+}
+
+internal data class SharedDaemonStatus(
+    val running: Boolean,
+    val cliVersion: String?,
+    val appServerVersion: String?,
+)
 
 internal class TransportAbortPlan(
     private val blockOutbound: List<() -> Unit>,
@@ -58,18 +74,21 @@ class ActiveSshTransport internal constructor(
     private val ssh: SSHClient,
     private val session: Session,
     private val command: Session.Command,
+    private val messageChannel: AppServerMessageChannel,
     val fingerprint: String,
     val remotePlatform: RemotePlatform,
     val codexVersion: String,
+    val sharedDaemon: Boolean,
 ) : Closeable {
-    private val inbound = command.inputStream
     private val outbound = command.outputStream
     private val errorInbound = command.errorStream
     private val closeGate = TransportCloseGate()
 
-    val reader: BufferedReader = BufferedReader(InputStreamReader(inbound, Charsets.UTF_8))
-    val writer: BufferedWriter = BufferedWriter(OutputStreamWriter(outbound, Charsets.UTF_8))
     val errorReader: BufferedReader = BufferedReader(InputStreamReader(errorInbound, Charsets.UTF_8))
+
+    fun readMessage(maxChars: Int): String? = messageChannel.readMessage(maxChars)
+
+    fun writeMessage(message: String) = messageChannel.writeMessage(message)
 
     private val abortPlan = TransportAbortPlan(
         blockOutbound = listOf(
@@ -80,9 +99,8 @@ class ActiveSshTransport internal constructor(
             { ssh.close() },
         ),
         cleanupStreams = listOf(
-            { reader.close() },
+            { messageChannel.close() },
             { errorReader.close() },
-            { writer.close() },
         ),
     )
 
@@ -92,7 +110,7 @@ class ActiveSshTransport internal constructor(
 
     override fun close() {
         closeGate.run {
-            runCatching { writer.close() }
+            runCatching { messageChannel.close() }
             runCatching { command.close() }
             runCatching { session.close() }
             runCatching { ssh.disconnect() }
@@ -111,22 +129,24 @@ class SshAppServerTransportFactory(private val context: Context) {
         try {
             val remotePlatform = resolvePlatform(ssh, connection.platform)
             val codexVersion = readCodexVersion(ssh, remotePlatform)
-            ssh.timeout = 0
-            val session = ssh.startSession()
-            try {
-                val command = session.exec(appServerCommand(remotePlatform))
-                ActiveSshTransport(
-                    ssh = ssh,
-                    session = session,
-                    command = command,
-                    fingerprint = observedFingerprint,
-                    remotePlatform = remotePlatform,
-                    codexVersion = codexVersion,
-                )
-            } catch (error: Throwable) {
-                runCatching { session.close() }
-                throw error
+            val sharedDaemonStatus = try {
+                ensureSharedDaemon(ssh, remotePlatform, codexVersion)
+            } catch (_: Exception) {
+                null
             }
+            val opened = openAppServer(ssh, remotePlatform, sharedDaemonStatus != null)
+            val servingCodexVersion = servingCodexVersion(opened.mode, codexVersion, sharedDaemonStatus)
+            ssh.timeout = 0
+            ActiveSshTransport(
+                ssh = ssh,
+                session = opened.session,
+                command = opened.command,
+                messageChannel = opened.messageChannel,
+                fingerprint = observedFingerprint,
+                remotePlatform = remotePlatform,
+                codexVersion = servingCodexVersion,
+                sharedDaemon = opened.mode == AppServerConnectionMode.SHARED_DAEMON,
+            )
         } catch (error: Throwable) {
             runCatching { ssh.disconnect() }
             runCatching { ssh.close() }
@@ -232,6 +252,74 @@ class SshAppServerTransportFactory(private val context: Context) {
         return version.substringAfter(' ').trim()
     }
 
+    private fun ensureSharedDaemon(
+        ssh: SSHClient,
+        platform: RemotePlatform,
+        expectedCodexVersion: String,
+    ): SharedDaemonStatus? {
+        val current = runCommand(ssh, daemonVersionCommand(platform))
+        val currentStatus = current.stdout.takeIf { current.exitStatus == 0 }
+            ?.let(::parseSharedDaemonStatus)
+        if (currentStatus?.running == true) {
+            return currentStatus.takeIf { it.isCompatibleWith(expectedCodexVersion) }
+        }
+
+        val started = runCommand(ssh, daemonStartCommand(platform))
+        if (started.exitStatus != 0) return null
+        val afterStart = runCommand(ssh, daemonVersionCommand(platform))
+        val startedStatus = afterStart.stdout.takeIf { afterStart.exitStatus == 0 }
+            ?.let(::parseSharedDaemonStatus)
+        return startedStatus?.takeIf { it.running && it.isCompatibleWith(expectedCodexVersion) }
+    }
+
+    private fun openAppServer(
+        ssh: SSHClient,
+        platform: RemotePlatform,
+        preferSharedDaemon: Boolean,
+    ): OpenedAppServer {
+        if (!preferSharedDaemon) return openAppServer(ssh, platform, AppServerConnectionMode.ISOLATED_STDIO)
+        return try {
+            openAppServer(ssh, platform, AppServerConnectionMode.SHARED_DAEMON)
+        } catch (sharedError: Exception) {
+            try {
+                openAppServer(ssh, platform, AppServerConnectionMode.ISOLATED_STDIO)
+            } catch (isolatedError: Throwable) {
+                isolatedError.addSuppressed(sharedError)
+                throw isolatedError
+            }
+        }
+    }
+
+    private fun openAppServer(
+        ssh: SSHClient,
+        platform: RemotePlatform,
+        mode: AppServerConnectionMode,
+    ): OpenedAppServer {
+        val session = ssh.startSession()
+        try {
+            val command = session.exec(appServerCommand(platform, mode))
+            try {
+                val messageChannel = when (mode) {
+                    AppServerConnectionMode.SHARED_DAEMON -> WebSocketAppServerMessageChannel.open(
+                        command.inputStream,
+                        command.outputStream,
+                    )
+                    AppServerConnectionMode.ISOLATED_STDIO -> JsonLineAppServerMessageChannel(
+                        command.inputStream,
+                        command.outputStream,
+                    )
+                }
+                return OpenedAppServer(session, command, messageChannel, mode)
+            } catch (error: Throwable) {
+                runCatching { command.close() }
+                throw error
+            }
+        } catch (error: Throwable) {
+            runCatching { session.close() }
+            throw error
+        }
+    }
+
     private fun runCommand(ssh: SSHClient, commandLine: String): ProbeResult {
         val session = ssh.startSession()
         return try {
@@ -260,6 +348,13 @@ class SshAppServerTransportFactory(private val context: Context) {
         val stderr: String,
     )
 
+    private data class OpenedAppServer(
+        val session: Session,
+        val command: Session.Command,
+        val messageChannel: AppServerMessageChannel,
+        val mode: AppServerConnectionMode,
+    )
+
     companion object {
         private const val PROBE_TIMEOUT_SECONDS = 15L
     }
@@ -272,12 +367,71 @@ internal fun codexVersionCommand(platform: RemotePlatform): String = when (platf
         "powershell.exe -NoLogo -NonInteractive -Command \"& { codex --version }\""
 }
 
-internal fun appServerCommand(platform: RemotePlatform): String = when (platform) {
+internal fun daemonVersionCommand(platform: RemotePlatform): String = when (platform) {
     RemotePlatform.AUTO -> error("AUTO platform must be resolved before building a Codex command")
-    RemotePlatform.POSIX ->
-        "exec \"\${SHELL:-/bin/sh}\" -lc 'exec codex app-server --listen stdio://'"
+    RemotePlatform.POSIX -> "exec \"\${SHELL:-/bin/sh}\" -lc 'codex app-server daemon version'"
     RemotePlatform.WINDOWS ->
-        "powershell.exe -NoLogo -NonInteractive -Command \"& { codex app-server --listen stdio:// }\""
+        "powershell.exe -NoLogo -NonInteractive -Command \"& { codex app-server daemon version }\""
+}
+
+internal fun daemonStartCommand(platform: RemotePlatform): String = when (platform) {
+    RemotePlatform.AUTO -> error("AUTO platform must be resolved before building a Codex command")
+    RemotePlatform.POSIX -> "exec \"\${SHELL:-/bin/sh}\" -lc 'codex app-server daemon start'"
+    RemotePlatform.WINDOWS ->
+        "powershell.exe -NoLogo -NonInteractive -Command \"& { codex app-server daemon start }\""
+}
+
+internal fun daemonReportsRunning(stdout: String): Boolean = stdout.lineSequence()
+    .mapNotNull(::parseSharedDaemonStatus)
+    .any(SharedDaemonStatus::running)
+
+internal fun parseSharedDaemonStatus(stdout: String): SharedDaemonStatus? = stdout.lineSequence()
+    .map(String::trim)
+    .filter { it.startsWith('{') && it.endsWith('}') }
+    .mapNotNull { line ->
+        runCatching {
+            val status = Json.parseToJsonElement(line).jsonObject
+            val state = status["status"]?.jsonPrimitive?.contentOrNull ?: return@runCatching null
+            SharedDaemonStatus(
+                running = state == "running",
+                cliVersion = status["cliVersion"]?.jsonPrimitive?.contentOrNull?.takeIf(String::isNotBlank),
+                appServerVersion = status["appServerVersion"]?.jsonPrimitive?.contentOrNull
+                    ?.takeIf(String::isNotBlank),
+            )
+        }.getOrNull()
+    }
+    .firstOrNull()
+
+internal fun SharedDaemonStatus.isCompatibleWith(expectedCodexVersion: String): Boolean =
+    running && expectedCodexVersion.isNotBlank() && appServerVersion == expectedCodexVersion
+
+internal fun servingCodexVersion(
+    mode: AppServerConnectionMode,
+    loginCliVersion: String,
+    daemonStatus: SharedDaemonStatus?,
+): String = if (mode == AppServerConnectionMode.SHARED_DAEMON) {
+    daemonStatus?.appServerVersion ?: loginCliVersion
+} else {
+    loginCliVersion
+}
+
+internal fun appServerCommand(
+    platform: RemotePlatform,
+    mode: AppServerConnectionMode = AppServerConnectionMode.ISOLATED_STDIO,
+): String = when (platform) {
+    RemotePlatform.AUTO -> error("AUTO platform must be resolved before building a Codex command")
+    RemotePlatform.POSIX -> when (mode) {
+        AppServerConnectionMode.SHARED_DAEMON ->
+            "exec \"\${SHELL:-/bin/sh}\" -lc 'exec codex app-server proxy'"
+        AppServerConnectionMode.ISOLATED_STDIO ->
+            "exec \"\${SHELL:-/bin/sh}\" -lc 'exec codex app-server --listen stdio://'"
+    }
+    RemotePlatform.WINDOWS -> when (mode) {
+        AppServerConnectionMode.SHARED_DAEMON ->
+            "powershell.exe -NoLogo -NonInteractive -Command \"& { codex app-server proxy }\""
+        AppServerConnectionMode.ISOLATED_STDIO ->
+            "powershell.exe -NoLogo -NonInteractive -Command \"& { codex app-server --listen stdio:// }\""
+    }
 }
 
 internal fun androidCompatibleSshConfig() = DefaultSecurityProviderConfig().apply {

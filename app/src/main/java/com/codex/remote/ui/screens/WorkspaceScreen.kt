@@ -2011,7 +2011,10 @@ private fun Composer(
     var addMenuOpen by remember(state.selectedThreadId) { mutableStateOf(false) }
     var showRemotePathPicker by remember(state.selectedThreadId) { mutableStateOf(false) }
     var goalModeActive by remember(state.selectedThreadId) { mutableStateOf(false) }
-    var policyMenu by remember { mutableStateOf(false) }
+    var policyMenu by remember(state.selectedThreadId, state.selectedProjectPath) { mutableStateOf(false) }
+    var showFullAccessConfirmation by remember(state.selectedThreadId, state.selectedProjectPath) {
+        mutableStateOf(false)
+    }
     val context = LocalContext.current
     val composerScope = rememberCoroutineScope()
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -2409,9 +2412,13 @@ private fun Composer(
                                     expanded = policyMenu,
                                     properties = composerMenuProperties,
                                     onDismiss = { policyMenu = false },
-                                    onSetPermissionMode = {
-                                        onSetPermissionMode(it)
+                                    onSetPermissionMode = { mode ->
                                         policyMenu = false
+                                        if (mode == PermissionMode.FULL_ACCESS) {
+                                            showFullAccessConfirmation = true
+                                        } else {
+                                            onSetPermissionMode(mode)
+                                        }
                                     },
                                     onSetPermissionProfile = {
                                         onSetPermissionProfile(it)
@@ -2561,6 +2568,16 @@ private fun Composer(
                 showRemotePathPicker = false
                 onClearRemoteDirectory()
             },
+        )
+    }
+    if (showFullAccessConfirmation) {
+        FullAccessConfirmationDialog(
+            isTurnRunning = state.isTurnRunning,
+            onConfirm = {
+                showFullAccessConfirmation = false
+                onSetPermissionMode(PermissionMode.FULL_ACCESS)
+            },
+            onDismiss = { showFullAccessConfirmation = false },
         )
     }
 }
@@ -3256,6 +3273,10 @@ private fun RemoteStatusDialog(state: AppUiState, onDismiss: () -> Unit) {
             Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
                 StatusLine("Task ID", state.selectedThreadId ?: "New task", monospace = true)
                 StatusLine("Codex", state.remoteServer?.codexVersion?.ifBlank { "Unknown" } ?: "Unknown")
+                StatusLine(
+                    "Desktop live sync",
+                    if (state.remoteServer?.sharedDaemon == true) "On · shared daemon" else "Off · isolated",
+                )
                 StatusLine("Model", state.selectedModel ?: "Unknown")
                 StatusLine(
                     "Context",
@@ -3350,7 +3371,9 @@ internal fun permissionModeFor(
     return when {
         approvalsReviewer == "auto_review" -> PermissionMode.AUTO_REVIEW
         permissionProfile == ":read-only" -> PermissionMode.READ_ONLY
-        permissionProfile == ":danger-full-access" || approvalPolicy == "never" -> PermissionMode.FULL_ACCESS
+        permissionProfile == ":danger-full-access" &&
+            approvalPolicy == "never" &&
+            approvalsReviewer == "user" -> PermissionMode.FULL_ACCESS
         else -> PermissionMode.ASK
     }
 }
@@ -3398,8 +3421,8 @@ private fun PermissionDropdown(
             onClick = { onSetPermissionMode(PermissionMode.AUTO_REVIEW) },
         )
         PermissionDropdownItem(
-            title = "Full access",
-            description = "Allow remote workspace and network access without asking",
+            title = "Full access for this task",
+            description = "Run commands and use files or the network in this task without asking",
             selected = selectedMode == PermissionMode.FULL_ACCESS,
             onClick = { onSetPermissionMode(PermissionMode.FULL_ACCESS) },
         )
@@ -3423,6 +3446,40 @@ private fun PermissionDropdown(
             }
         }
     }
+}
+
+@Composable
+private fun FullAccessConfirmationDialog(
+    isTurnRunning: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Full access for this task") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "Codex can run commands, use the network, and read or modify any files accessible " +
+                        "to the remote account without asking.",
+                )
+                Text("This setting applies only to this task.")
+                if (isTurnRunning) {
+                    Text(
+                        "A turn is currently running. Full access applies from the next turn and does " +
+                            "not change the permissions of the running turn.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onConfirm) { Text("Enable full access") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable
@@ -4172,7 +4229,7 @@ private fun ApprovalDialog(
                         TextButton(
                             onClick = { onDecision(requestKey, "acceptForSession", emptyMap()) },
                             enabled = !isResponding && approvalEnabled,
-                        ) { Text("Allow session") }
+                        ) { Text(approval.kind.sessionApprovalLabel()) }
                     }
                 }
                 TextButton(onClick = onDisconnect) {
@@ -4181,6 +4238,13 @@ private fun ApprovalDialog(
             }
         },
     )
+}
+
+private fun ApprovalKind.sessionApprovalLabel(): String = when (this) {
+    ApprovalKind.COMMAND -> "Allow commands for session"
+    ApprovalKind.FILE_CHANGE -> "Allow file changes for session"
+    ApprovalKind.PERMISSION -> "Allow permissions for session"
+    ApprovalKind.USER_INPUT, ApprovalKind.UNKNOWN -> "Allow for session"
 }
 
 @Composable

@@ -3,8 +3,9 @@
 ## Current implementation boundary (2026-08-10)
 
 The direct Android-to-SSH topology remains unchanged. The current branch adds
-the Paseo-inspired **multi-session state foundation**, not a relay, Android
-agent runtime, persistent remote daemon, or general remote shell API.
+the Paseo-inspired **multi-session state foundation** and shared Codex daemon
+subscription. It does not add an Internet relay, Android agent runtime, exposed
+app-server listener, or general remote shell API.
 
 Implemented in this branch:
 
@@ -19,15 +20,20 @@ Implemented in this branch:
 - a process-wide connection owner anchored by a user-visible foreground
   service; and
 - default-network monitoring with safe-boundary SSH/app-server handoff
-  and remote task reconciliation.
+  and remote task reconciliation;
+- shared-daemon-first transport using a validated RFC 6455 WebSocket inside the
+  SSH command stream, with pre-RPC isolated JSONL fallback; and
+- exact `clientUserMessageId` correlation so Desktop-origin and phone-origin
+  turns cannot claim each other's optimistic UI state.
 
 Not yet established by this implementation:
 
 - a complete multi-session dashboard or grouped approval inbox;
-- durable remote execution after the SSH app-server process itself exits;
+- guaranteed in-flight survival across proxy loss, daemon restart, or host
+  reboot;
 - Workspace/worktree lifecycle, terminal sessions, or rich Git mutation UI;
-- actual device upgrade/data-preservation compatibility (the signed `0.1.8`
-  candidate has the same package and signer as `0.1.7`/`0.1.6` and a higher
+- actual device upgrade/data-preservation compatibility (the signed `0.1.9`
+  candidate has the same package and signer as `0.1.8`/`0.1.7`/`0.1.6` and a higher
   version code, so the static upgrade prerequisites are established); or
 - physical-device, Android instrumentation runtime, and real SSH smoke proof.
 
@@ -36,8 +42,10 @@ Not yet established by this implementation:
 This client follows the public Codex app-server contract rather than embedding
 an agent on Android.
 
-- Codex source inspected at `openai/codex` commit
-  `61a44880a85d2fd0d8770908dea5733495e571c8` (2026-07-26).
+- Codex protocol baseline was inspected at `openai/codex` commit
+  `61a44880a85d2fd0d8770908dea5733495e571c8` (2026-07-26); shared-daemon and
+  proxy behavior was revalidated against tag `rust-v0.145.0`, commit
+  `25af12f7e61572b0bc18ddb1008be543b91519b0`.
 - Protocol definitions come from `codex-rs/app-server-protocol`.
 - Server behavior comes from `codex-rs/app-server`.
 - Desktop behavior and command registration were audited from Codex Desktop
@@ -61,9 +69,13 @@ Android UI
    v
 Remote login shell
    |
-   | codex app-server --listen stdio://
-   v
-JSONL transport over SSH stdin/stdout
+   +-- preferred: codex app-server proxy
+   |      -> HTTP Upgrade + RFC 6455 messages over SSH stdin/stdout
+   |      -> managed app-server daemon shared with Codex Desktop
+   |
+   +-- compatibility fallback, before any RPC only:
+          codex app-server --listen stdio://
+          -> JSONL messages over SSH stdin/stdout
    |
    +-- initialize / initialized
    +-- thread/list (all cursor pages, no cwd filter)
@@ -84,6 +96,18 @@ JSONL transport over SSH stdin/stdout
 
 Agent execution, repository access, authentication, tools and approvals remain
 owned by the remote Codex installation. Android has no local agent runtime.
+
+The managed daemon is checked with `codex app-server daemon version` and started
+idempotently when supported. Android never bootstraps, upgrades, or restarts an
+existing daemon. A WebSocket Upgrade failure closes that SSH command and opens a
+fresh isolated command; after Upgrade succeeds, any framing, UTF-8, size, or RPC
+protocol violation fails closed without fallback because replaying a request on
+a second server could duplicate work.
+
+The daemon keeps subscriber sets per task. `thread/resume` subscribes each
+connection, so an item or turn created from Android is broadcast to an open
+Desktop client and vice versa. The task history files were already shared in
+isolated mode; the shared daemon adds the missing in-memory event fan-out.
 
 ## Background lifetime and network recovery
 
@@ -139,20 +163,22 @@ notification and stops with `START_NOT_STICKY` instead of leaving an orphan
 service. SSH shutdown is detached on the main thread and closed on an I/O scope
 to avoid blocking the Android UI on a dead route.
 
-Reconnect always creates a new SSH process and app-server protocol session,
-reruns initialization and host-key verification, reloads remote threads, and
-resumes the previously selected thread from remote truth. It does not replay an
-in-flight user message or approval. If transport loss made connected work
-ambiguous, the restored UI explicitly asks the user to verify the remote result.
+Reconnect always creates a new SSH transport and app-server protocol
+connection, reruns initialization and host-key verification, reloads remote
+threads, and resumes the previously selected thread from remote truth. Shared
+mode reconnects to the existing managed daemon; isolated mode starts a new
+stdio app-server process. It does not replay an in-flight user message or
+approval. If transport loss made connected work ambiguous, the restored UI
+explicitly asks the user to verify the remote result.
 Host-key, authentication, remote setup,
 protocol-identity, ownership, and ambiguous approval-delivery failures suspend
 automatic recovery and require explicit user action.
 
-This is logical session recovery, not TCP migration or durable remote
-execution. Android may still stop the app through force-stop/Task Manager, and
-a tunnel transition can terminate the SSH-bound app-server (including an
-in-flight turn). True uninterrupted remote work still requires the separately
-gated persistent daemon/relay design described in Phase 4 of the handoff.
+This is logical session recovery, not TCP migration. Android may still stop the
+app through force-stop/Task Manager. The managed daemon is no longer tied to one
+Android SSH command, but uninterrupted in-flight execution across transport
+loss, daemon restart, and host reboot remains a separate physical-device and
+remote-runtime verification gate rather than a release claim.
 
 ## Session state and exact event routing
 
@@ -205,6 +231,14 @@ asynchronous loads and starts. A callback must still belong to the same RPC
 client and generation before it can publish state. Selection-sensitive work
 also carries selection ownership. This prevents an old SSH connection or an
 older task load from overwriting the successor connection/session view.
+
+In shared mode a bare `turn/started` notification is not proof that Android
+started the turn; it may have come from Desktop. Android sends its optimistic
+item ID as `clientUserMessageId`, and only a user item echoing that exact
+`clientId` (or the exact `turn/start` response) establishes local ownership.
+The same message body from another client is retained as a distinct item. If a
+phone start fails while a Desktop-origin turn is active, only the phone's local
+optimistic item is removed; the authoritative external turn remains visible.
 
 ### Retention and eviction
 
@@ -281,7 +315,8 @@ whose OAuth provider redirects to loopback must configure a reachable
 - Android backup and device transfer are disabled for all app data domains.
 - A new SSH host is rejected before authentication and its SHA-256 fingerprint
   is shown for explicit confirmation. A changed key is always blocked.
-- app-server uses stdio inside SSH. No app-server TCP listener is exposed.
+- app-server uses either WebSocket framing through `app-server proxy` or JSONL
+  stdio inside SSH. No app-server TCP listener is exposed.
 - The remote thread starts with `workspace-write` sandboxing and `on-request`
   approval by default. Named permission profiles are loaded from the host.
   Explicit full access maps to the app-server `dangerFullAccess` policy.
@@ -297,6 +332,10 @@ installation is upgraded across major protocol changes.
 Current SSH connection setup supports direct password and private-key hosts.
 OpenSSH config expansion, ProxyJump, hardware-backed SSH agents and managed
 Remote Control relay pairing are not implemented.
+
+Codex versions without the managed daemon/proxy commands remain usable through
+isolated JSONL fallback. That mode intentionally cannot provide live fan-out to
+an already open Desktop task and is labeled accordingly in the UI.
 
 SSHJ's `curve25519` key-exchange factories are excluded on Android because the
 platform JCA does not expose the `X25519` key-pair generator expected by SSHJ.

@@ -68,6 +68,13 @@ val block = "${'$'}stillRaw${'$'}"
         assertEquals(PermissionMode.ASK, permissionModeFor(":workspace", "on-request", "user"))
         assertEquals(PermissionMode.AUTO_REVIEW, permissionModeFor(":workspace", "on-request", "auto_review"))
         assertEquals(PermissionMode.FULL_ACCESS, permissionModeFor(":danger-full-access", "never", "user"))
+        assertEquals(PermissionMode.ASK, permissionModeFor(":danger-full-access", "on-request", "user"))
+        assertEquals(PermissionMode.ASK, permissionModeFor(":workspace", "never", "user"))
+        assertEquals(PermissionMode.ASK, permissionModeFor(":danger-full-access", "never", "guardian"))
+        assertEquals(
+            PermissionMode.AUTO_REVIEW,
+            permissionModeFor(":danger-full-access", "never", "auto_review"),
+        )
         assertEquals(PermissionMode.READ_ONLY, permissionModeFor(":read-only", "on-request", "user"))
         assertNull(permissionModeFor("team-policy", "on-request", "user"))
     }
