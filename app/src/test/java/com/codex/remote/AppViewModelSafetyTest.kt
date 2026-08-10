@@ -8,10 +8,14 @@ import com.codex.remote.domain.RemoteModel
 import com.codex.remote.domain.RemoteServiceTier
 import com.codex.remote.domain.RemoteThread
 import com.codex.remote.domain.RpcRequestId
+import com.codex.remote.domain.TimelineItem
+import com.codex.remote.domain.TimelineKind
 import com.codex.remote.session.SessionDiagnosticCode
 import com.codex.remote.session.SessionLimits
 import com.codex.remote.session.SessionRegistry
 import com.codex.remote.session.SessionState
+import com.codex.remote.session.SessionStreamStatus
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -207,6 +211,97 @@ class AppViewModelSafetyTest {
                 .withSessionRegistry(restored.registry)
                 .isOlderHistoryLoading,
         )
+    }
+
+    @Test
+    fun failedPhoneSubmissionDoesNotClearAnAuthoritativeDesktopTurn() {
+        val failedLocalItem = TimelineItem(id = "local-phone", kind = TimelineKind.USER, body = "phone")
+        val authoritativeRemoteItem = TimelineItem(id = "remote-desktop", kind = TimelineKind.USER, body = "desktop")
+        val session = SessionState(
+            threadId = "thread-a",
+            timeline = listOf(authoritativeRemoteItem, failedLocalItem),
+            isTurnRunning = true,
+            activeTurnId = "turn-desktop",
+            expectedTurnId = "turn-desktop",
+            streamStatus = SessionStreamStatus.RUNNING,
+        )
+
+        val rolledBack = session.rollbackFailedOptimisticSubmission(
+            localItemId = failedLocalItem.id,
+            preserveTurnState = false,
+        )
+
+        assertEquals(listOf(authoritativeRemoteItem), rolledBack.timeline)
+        assertTrue(rolledBack.isTurnRunning)
+        assertEquals("turn-desktop", rolledBack.activeTurnId)
+        assertEquals("turn-desktop", rolledBack.expectedTurnId)
+        assertEquals(SessionStreamStatus.RUNNING, rolledBack.streamStatus)
+    }
+
+    @Test
+    fun failedPhoneSubmissionClearsOnlyItsUnconfirmedTurnState() {
+        val failedLocalItem = TimelineItem(id = "local-phone", kind = TimelineKind.USER, body = "phone")
+        val session = SessionState(
+            threadId = "thread-a",
+            timeline = listOf(failedLocalItem),
+            isTurnRunning = true,
+            activeTurnId = null,
+            expectedTurnId = "turn-unconfirmed",
+            streamStatus = SessionStreamStatus.RUNNING,
+        )
+
+        val rolledBack = session.rollbackFailedOptimisticSubmission(
+            localItemId = failedLocalItem.id,
+            preserveTurnState = false,
+        )
+
+        assertTrue(rolledBack.timeline.isEmpty())
+        assertFalse(rolledBack.isTurnRunning)
+        assertNull(rolledBack.activeTurnId)
+        assertNull(rolledBack.expectedTurnId)
+        assertEquals(SessionStreamStatus.FAILED, rolledBack.streamStatus)
+    }
+
+    @Test
+    fun navigationPathsReleaseBufferedResumeEventsBeforeAdvancingSelection() {
+        val source = appViewModelSource()
+        assertReleaseBeforeAdvance(
+            name = "newThread",
+            source = source.functionBlock("    fun newThread() {", "    fun selectProject("),
+        )
+        assertReleaseBeforeAdvance(
+            name = "selectProject",
+            source = source.functionBlock("    fun selectProject(", "    fun selectThread("),
+        )
+        assertReleaseBeforeAdvance(
+            name = "archiveThread",
+            source = source.functionBlock("    fun archiveThread(", "    fun loadArchivedThreads("),
+        )
+        assertReleaseBeforeAdvance(
+            name = "forkThread",
+            source = source.functionBlock("    fun forkThread(", "    fun startReview("),
+        )
+    }
+
+    private fun appViewModelSource(): String = listOf(
+        File("src/main/java/com/codex/remote/AppViewModel.kt"),
+        File("app/src/main/java/com/codex/remote/AppViewModel.kt"),
+    ).firstOrNull(File::isFile)?.readText()
+        ?: error("Could not locate AppViewModel.kt from ${File(".").absolutePath}")
+
+    private fun String.functionBlock(start: String, next: String): String {
+        val startIndex = indexOf(start)
+        require(startIndex >= 0) { "Missing function marker: $start" }
+        val endIndex = indexOf(next, startIndex + start.length)
+        require(endIndex > startIndex) { "Missing next function marker: $next" }
+        return substring(startIndex, endIndex)
+    }
+
+    private fun assertReleaseBeforeAdvance(name: String, source: String) {
+        val releaseIndex = source.indexOf("releaseActiveResumeEvents()")
+        val advanceIndex = source.indexOf("sessionRequestTracker.advanceSelection()")
+        assertTrue("$name must release an active resume", releaseIndex >= 0)
+        assertTrue("$name must release before advancing selection", releaseIndex < advanceIndex)
     }
 
     private fun remoteThread(status: String) = RemoteThread(

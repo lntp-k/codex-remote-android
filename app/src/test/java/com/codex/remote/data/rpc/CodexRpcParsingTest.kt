@@ -28,12 +28,24 @@ class CodexRpcParsingTest {
     @Test
     fun preservesGoalMetadataOnUserMessagesWhenProvided() {
         val item = parse(
-            """{"type":"userMessage","id":"goal-1","goal":true,"content":[{"type":"text","text":"Ship it"}]}""",
+            """{"type":"userMessage","id":"goal-1","clientId":"local-123","goal":true,"content":[{"type":"text","text":"Ship it"}]}""",
         )
 
         assertEquals(TimelineKind.USER, item?.kind)
         assertEquals("Ship it", item?.body)
         assertTrue(item?.isGoal == true)
+        assertEquals("local-123", item?.clientId)
+    }
+
+    @Test
+    fun oversizedClientMessageIdIsNotRetained() {
+        val oversized = "x".repeat(MAX_CLIENT_USER_MESSAGE_ID_CHARS + 1)
+        val item = parse(
+            """{"type":"userMessage","id":"user-1","clientId":"$oversized","content":[{"type":"text","text":"hello"}]}""",
+        )
+
+        assertEquals("hello", item?.body)
+        assertNull(item?.clientId)
     }
 
     @Test

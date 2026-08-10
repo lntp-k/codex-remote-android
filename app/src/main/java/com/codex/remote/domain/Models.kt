@@ -223,6 +223,7 @@ data class RemoteServerInfo(
     val platformFamily: String,
     val platformOs: String,
     val codexVersion: String,
+    val sharedDaemon: Boolean,
 )
 
 data class RemoteAccount(
@@ -352,6 +353,7 @@ data class TimelineItem(
     val isGoal: Boolean = false,
     val turnId: String? = null,
     val fileChangesComplete: Boolean = true,
+    val clientId: String? = null,
 )
 
 data class FileChangeSummary(

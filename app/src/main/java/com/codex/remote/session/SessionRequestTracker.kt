@@ -28,6 +28,7 @@ internal enum class TurnStartResponseDisposition {
 private data class TurnStartOperation(
     val connectionGeneration: Long,
     val operationSequence: Long,
+    val clientUserMessageId: String? = null,
     val observedTurnId: String? = null,
     val terminal: Boolean = false,
 )
@@ -101,12 +102,17 @@ internal class SessionRequestTracker(
 
     fun isCurrentConnection(generation: Long): Boolean = generation == connectionGeneration
 
-    fun beginTurnStart(threadId: String): TurnStartToken {
+    fun beginTurnStart(
+        threadId: String,
+        clientUserMessageId: String? = null,
+    ): TurnStartToken {
         require(threadId.isNotBlank())
+        require(clientUserMessageId == null || clientUserMessageId.isNotBlank())
         val sequence = ++turnStartSequence
         latestTurnStartByThread[threadId] = TurnStartOperation(
             connectionGeneration = connectionGeneration,
             operationSequence = sequence,
+            clientUserMessageId = clientUserMessageId,
         )
         return TurnStartToken(threadId, connectionGeneration, sequence)
     }
@@ -123,9 +129,28 @@ internal class SessionRequestTracker(
         if (!canObserveTurnStarted(threadId, turnId)) return false
         val operation = latestTurnStartByThread[threadId] ?: return true
         if (operation.connectionGeneration != connectionGeneration || operation.terminal) return true
+        // A shared daemon broadcasts starts from every subscribed client. When this
+        // operation has an origin ID, only the matching user item or RPC response
+        // can establish ownership; a bare turn/started may belong to the desktop.
+        if (operation.clientUserMessageId != null && operation.observedTurnId == null) return true
         if (operation.observedTurnId == null || operation.observedTurnId == turnId) {
             latestTurnStartByThread[threadId] = operation.copy(observedTurnId = turnId)
         }
+        return true
+    }
+
+    fun observeUserMessage(
+        threadId: String,
+        turnId: String,
+        clientUserMessageId: String,
+    ): Boolean {
+        if (threadId.isBlank() || turnId.isBlank() || clientUserMessageId.isBlank()) return false
+        val operation = latestTurnStartByThread[threadId] ?: return true
+        if (operation.connectionGeneration != connectionGeneration || operation.terminal) return true
+        if (operation.clientUserMessageId != clientUserMessageId) return true
+        if (CompletedTurnKey(threadId, turnId) in recentCompletedTurns) return false
+        if (operation.observedTurnId != null && operation.observedTurnId != turnId) return false
+        latestTurnStartByThread[threadId] = operation.copy(observedTurnId = turnId)
         return true
     }
 

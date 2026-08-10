@@ -140,6 +140,7 @@ class ThreadListPaginationTest {
             model = "gpt-5.6-sol",
             reasoningEffort = "high",
             approvalPolicy = "on-request",
+            clientUserMessageId = "local-phone-1",
             mentions = listOf(
                 ComposerMention(ComposerMentionKind.SKILL, "deploy", "/skills/deploy/SKILL.md", "\$deploy"),
                 ComposerMention(ComposerMentionKind.PLUGIN, "Linear", "plugin://linear@openai-curated", "\$linear"),
@@ -151,6 +152,7 @@ class ThreadListPaginationTest {
         assertEquals("/skills/deploy/SKILL.md", inputs[1].getValue("path").jsonPrimitive.content)
         assertEquals("plugin://linear@openai-curated", inputs[2].getValue("path").jsonPrimitive.content)
         assertEquals("high", params.getValue("effort").jsonPrimitive.content)
+        assertEquals("local-phone-1", params.getValue("clientUserMessageId").jsonPrimitive.content)
     }
 
     @Test
@@ -199,10 +201,12 @@ class ThreadListPaginationTest {
             text = "Also run the focused tests",
             mentions = emptyList(),
             attachments = emptyList(),
+            clientUserMessageId = "local-phone-steer",
         )
 
         assertEquals("thread-1", params.getValue("threadId").jsonPrimitive.content)
         assertEquals("turn-9", params.getValue("expectedTurnId").jsonPrimitive.content)
+        assertEquals("local-phone-steer", params.getValue("clientUserMessageId").jsonPrimitive.content)
         assertEquals("text", params.getValue("input").jsonArray.single().jsonObject.getValue("type").jsonPrimitive.content)
     }
 

@@ -9,10 +9,10 @@ Audit baseline:
 Verification labels in this file distinguish source/automated implementation
 from device/runtime proof. The Android 16 and multi-session changes described
 below have automated coverage, and final local ARM64 build counts/digests are
-recorded in `docs/verification/ANDROID_16_MIGRATION.md`. A signed `0.1.7` QA
-candidate and signer continuity with `0.1.6` are verified. Actual upgrade
-installation, Android instrumented runtime, physical devices, and real SSH
-smoke are still pending.
+recorded in `docs/verification/ANDROID_16_MIGRATION.md`. Signed `0.1.7` and
+`0.1.8` candidates preserve signer continuity with `0.1.6`. The `0.1.9`
+shared-daemon candidate has automated protocol coverage and a two-client daemon
+fan-out probe; physical Android-to-Desktop UI proof remains a release gate.
 
 ## Implemented remote workflow
 
@@ -29,6 +29,7 @@ smoke are still pending.
 | MCP | Show server/tool/resource status, start OAuth, observe completion, and reload remote MCP configuration. |
 | Authentication | Reuse remote auth and support the ChatGPT device-code flow. |
 | Session state | Keep independent bounded timeline, history, goal, settings, turn, approval, unread, and diagnostic state for known remote threads; route interleaved events by exact thread/turn identity. |
+| Cross-client live sync | Prefer the same managed app-server daemon used by Codex Desktop, subscribe with `thread/resume`, and receive bidirectional task events through a validated WebSocket carried inside SSH. Older/incompatible hosts fall back to visibly isolated JSONL mode before any RPC is sent. |
 | Session supervision (partial) | Show per-task running, approval, failed, and unread indicators in the existing project/task navigation. This is not yet a dedicated dashboard. |
 | Approvals | Command, file-change, permission, and structured user-input requests in one arrival-ordered surface. Show exact owner task/path/ID; background or unknown owners cannot be allowed until the exact task is opened, while deny remains available. This is not yet a grouped inbox. |
 | Diagnostics | Context and rate-limit status, app-server warnings, feedback upload, and SSH host-key pinning. |

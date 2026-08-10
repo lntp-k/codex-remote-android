@@ -190,6 +190,7 @@ internal fun TimelineItem.retainedCharacterCount(): Long {
     retained = retained.saturatingAdd(body)
     retained = retained.saturatingAdd(status)
     retained = retained.saturatingAdd(turnId)
+    retained = retained.saturatingAdd(clientId)
     fileChanges.forEach { change ->
         retained = retained.saturatingAdd(change.path)
         retained = retained.saturatingAdd(change.kind)

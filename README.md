@@ -6,8 +6,11 @@
 An Android client for Codex hosts reached over SSH. A saved connection represents
 one host; after connecting, the app imports every resumable remote Codex
 conversation and groups projects from each thread's working directory. The app
-does not run a local agent: it starts `codex app-server` remotely and speaks its
-JSONL protocol over SSH.
+does not run a local agent. It first tries to attach to the remote Codex managed
+app-server daemon through `codex app-server proxy`, carrying the daemon's
+WebSocket protocol inside SSH. If that daemon surface is unavailable before any
+RPC is sent, it safely falls back to an isolated `codex app-server --listen
+stdio://` JSONL process.
 
 Implementation notes and the audited Codex source boundary are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -28,6 +31,14 @@ Opening a conversation resumes its live app-server subscription while loading
 only the latest five full turns; older turns are fetched as the chat is scrolled
 to the top, with a legacy full-history fallback for older Codex hosts.
 
+When Codex Desktop and Android connect to the same remote host, use the same
+managed daemon, and have resumed the same task, the daemon broadcasts new turn
+and item events to both clients. This is what makes a phone-authored message
+appear live in an already open Desktop task. The connection status reports
+**Desktop live sync** in shared mode. It explicitly reports **isolated** when the
+compatibility fallback is active; persisted history is still available there,
+but an already open Desktop window will not receive the phone event live.
+
 The model and reasoning pickers are also remote data. They are loaded from
 `model/list`, so the choices follow the Codex version and account configured on
 that SSH host rather than a hard-coded Android catalog.
@@ -36,6 +47,13 @@ The composer uses the same remote app-server surfaces for Plan mode, service
 tiers, permission profiles, image input, running-turn steering, Goals, context
 compaction, forks, code review, MCP status, remote skills and installed plugins.
 Task pins are stored on the remote Codex thread rather than only on Android.
+
+The permission menu includes **Full access for this task**. It requires an
+explicit confirmation that Codex may run commands, use the network, and read or
+modify any files accessible to the remote account without asking. The exact
+authorization tuple is stored with the selected task; if a turn is already
+running, the change starts with the next turn. Narrow command, file-change, and
+permission approvals for the current app-server session remain separate.
 
 ## Install
 
@@ -76,6 +94,11 @@ foreground monitor and resumes from a fresh budget when the default network
 changes; waking resumes any retry budget that was merely paused by Doze, and
 **Connect** can retry immediately.
 
+The shared daemon is reached only through the authenticated SSH command stream.
+Android does not expose an app-server TCP port. A failed WebSocket Upgrade may
+fall back before initialization; a protocol failure after Upgrade disconnects
+fail-closed and is never replayed into an isolated server.
+
 To produce a signed release build, provide these environment variables before
 running `./gradlew assembleRelease`:
 
@@ -88,6 +111,9 @@ CODEX_REMOTE_KEY_PASSWORD
 
 Signing material must remain outside the repository. APKs, keystores, local SDK
 configuration, build caches, and QA captures are excluded by `.gitignore`.
+
+The signed `0.1.9` implementation and release-candidate evidence are recorded in
+[`docs/verification/SHARED_DAEMON_LIVE_SYNC_0.1.9.md`](docs/verification/SHARED_DAEMON_LIVE_SYNC_0.1.9.md).
 
 ## License
 

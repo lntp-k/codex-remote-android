@@ -2,6 +2,8 @@ package com.codex.remote.data.rpc
 
 import com.codex.remote.BuildConfig
 import com.codex.remote.data.ssh.ActiveSshTransport
+import com.codex.remote.data.transport.AppServerMessageProtocolException
+import com.codex.remote.data.transport.AppServerMessageTooLongException
 import com.codex.remote.domain.ApprovalKind
 import com.codex.remote.domain.ApprovalContextField
 import com.codex.remote.domain.ApprovalOption
@@ -69,6 +71,7 @@ import kotlinx.serialization.json.put
 import java.io.BufferedReader
 import java.io.Closeable
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -181,37 +184,78 @@ private fun diagnosticPreview(value: String): String = if (value.length <= MAX_D
 }
 
 internal class OutstandingApprovalRequests {
+    enum class Reservation { NEW, EXACT_REPLAY, STALE_AFTER_RESOLUTION, REJECTED }
+    enum class Resolution { RESOLVED, UNKNOWN, REJECTED }
     private enum class State { PENDING, RESPONDING, RESPONDED, RESOLVED_DURING_RESPONSE }
     private data class TrackedRequest(
         val threadId: String?,
         val retainedChars: Long,
+        val replayIdentity: ByteArray?,
         var state: State,
+    )
+    private data class ResolutionTombstone(
+        val id: RpcRequestId,
+        val threadId: String,
+        val retainedChars: Long,
     )
 
     private val lock = Any()
     private val requests = mutableMapOf<RpcRequestId, TrackedRequest>()
+    private val resolutionTombstones = linkedSetOf<ResolutionTombstone>()
     private var retainedIdChars = 0L
     private var retainedApprovalChars = 0L
+    private var retainedTombstoneChars = 0L
     private var invalid = false
 
     fun reserve(
         id: RpcRequestId,
         threadId: String? = null,
         retainedChars: Long = id.displayValue.length.toLong(),
-    ): Boolean = synchronized(lock) {
+    ): Boolean = reserveInternal(id, threadId, retainedChars, replayIdentity = null) == Reservation.NEW
+
+    fun reserveOrReplay(
+        id: RpcRequestId,
+        threadId: String?,
+        retainedChars: Long,
+        replayIdentity: ByteArray,
+    ): Reservation = reserveInternal(id, threadId, retainedChars, replayIdentity)
+
+    private fun reserveInternal(
+        id: RpcRequestId,
+        threadId: String?,
+        retainedChars: Long,
+        replayIdentity: ByteArray?,
+    ): Reservation = synchronized(lock) {
         val idChars = id.displayValue.length.toLong()
         val effectiveRetainedChars = maxOf(idChars, retainedChars)
-        if (invalid || id in requests || requests.size >= MAX_TRACKED_APPROVAL_REQUESTS ||
-            idChars > MAX_TRACKED_APPROVAL_ID_CHARS - retainedIdChars ||
+        if (invalid) return@synchronized Reservation.REJECTED
+        val tombstone = resolutionTombstones.firstOrNull { it.id == id }
+        if (tombstone != null) {
+            if (tombstone.threadId == threadId) return@synchronized Reservation.STALE_AFTER_RESOLUTION
+            invalid = true
+            return@synchronized Reservation.REJECTED
+        }
+        val existing = requests[id]
+        if (existing != null) {
+            val isExactReplay = replayIdentity != null &&
+                existing.replayIdentity != null &&
+                existing.threadId == threadId &&
+                MessageDigest.isEqual(existing.replayIdentity, replayIdentity)
+            if (isExactReplay) return@synchronized Reservation.EXACT_REPLAY
+            invalid = true
+            return@synchronized Reservation.REJECTED
+        }
+        if (requests.size + resolutionTombstones.size >= MAX_TRACKED_APPROVAL_REQUESTS ||
+            idChars > MAX_TRACKED_APPROVAL_ID_CHARS - retainedIdChars - retainedTombstoneChars ||
             effectiveRetainedChars > MAX_TRACKED_APPROVAL_RETAINED_CHARS - retainedApprovalChars
         ) {
             invalid = true
-            false
+            Reservation.REJECTED
         } else {
-            requests[id] = TrackedRequest(threadId, effectiveRetainedChars, State.PENDING)
+            requests[id] = TrackedRequest(threadId, effectiveRetainedChars, replayIdentity, State.PENDING)
             retainedIdChars += idChars
             retainedApprovalChars += effectiveRetainedChars
-            true
+            Reservation.NEW
         }
     }
 
@@ -219,27 +263,53 @@ internal class OutstandingApprovalRequests {
         invalid = true
     }
 
-    fun resolve(id: RpcRequestId, threadId: String? = null): Boolean = synchronized(lock) {
-        if (invalid) return@synchronized false
+    fun resolve(id: RpcRequestId, threadId: String? = null): Boolean =
+        resolveOrIgnore(id, threadId) == Resolution.RESOLVED
+
+    fun resolveOrIgnore(id: RpcRequestId, threadId: String? = null): Resolution = synchronized(lock) {
+        if (invalid) return@synchronized Resolution.REJECTED
         val tracked = requests[id]
-        if (tracked == null || tracked.threadId != threadId) {
+        if (tracked == null) {
+            val exactThreadId = threadId?.takeIf(String::isNotBlank)
+            if (exactThreadId == null) {
+                invalid = true
+                return@synchronized Resolution.REJECTED
+            }
+            val existingTombstone = resolutionTombstones.firstOrNull { it.id == id }
+            if (existingTombstone != null) {
+                if (existingTombstone.threadId == exactThreadId) return@synchronized Resolution.UNKNOWN
+                invalid = true
+                return@synchronized Resolution.REJECTED
+            }
+            val tombstoneChars = id.displayValue.length.toLong() + exactThreadId.length.toLong()
+            if (requests.size + resolutionTombstones.size >= MAX_TRACKED_APPROVAL_REQUESTS ||
+                tombstoneChars > MAX_TRACKED_APPROVAL_ID_CHARS - retainedIdChars - retainedTombstoneChars
+            ) {
+                invalid = true
+                return@synchronized Resolution.REJECTED
+            }
+            resolutionTombstones += ResolutionTombstone(id, exactThreadId, tombstoneChars)
+            retainedTombstoneChars += tombstoneChars
+            return@synchronized Resolution.UNKNOWN
+        }
+        if (tracked.threadId != threadId) {
             invalid = true
-            return@synchronized false
+            return@synchronized Resolution.REJECTED
         }
         when (tracked.state) {
             State.PENDING, State.RESPONDED -> {
                 requests.remove(id)
                 retainedIdChars -= id.displayValue.length.toLong()
                 retainedApprovalChars -= tracked.retainedChars
-                true
+                Resolution.RESOLVED
             }
             State.RESPONDING -> {
                 tracked.state = State.RESOLVED_DURING_RESPONSE
-                true
+                Resolution.RESOLVED
             }
             State.RESOLVED_DURING_RESPONSE -> {
                 invalid = true
-                false
+                Resolution.REJECTED
             }
         }
     }
@@ -293,7 +363,7 @@ internal fun trackedServerRequestEvent(
     id: RpcRequestId,
     method: String,
     params: JsonObject,
-): AppServerEvent {
+): AppServerEvent? {
     val rawParams = params.toString()
     val messageChars = id.displayValue.length.toLong() + method.length.toLong() + rawParams.length.toLong()
     if (messageChars > MAX_APPROVAL_MESSAGE_CHARS) {
@@ -309,28 +379,52 @@ internal fun trackedServerRequestEvent(
             "Remote sent an unsupported JSON-RPC server request; disconnected without guessing a response.",
         )
     }
-    if (!requests.reserve(id, request.threadId, request.retainedCharCount)) {
-        return AppServerEvent.FatalProtocolError(
-            "Remote reused an outstanding approval request ID or exceeded the safe tracking limit; " +
-                "disconnected without responding.",
+    return when (
+        requests.reserveOrReplay(
+            id = id,
+            threadId = request.threadId,
+            retainedChars = request.retainedCharCount,
+            replayIdentity = approvalReplayIdentity(method, rawParams),
+        )
+    ) {
+        OutstandingApprovalRequests.Reservation.NEW -> AppServerEvent.Approval(request.threadId, request)
+        OutstandingApprovalRequests.Reservation.EXACT_REPLAY -> null
+        OutstandingApprovalRequests.Reservation.STALE_AFTER_RESOLUTION -> null
+        OutstandingApprovalRequests.Reservation.REJECTED -> AppServerEvent.FatalProtocolError(
+            "Remote reused an outstanding approval request ID with changed authorization context " +
+                "or exceeded the safe tracking limit; disconnected without responding.",
         )
     }
-    return AppServerEvent.Approval(request.threadId, request)
 }
+
+private fun approvalReplayIdentity(method: String, rawParams: String): ByteArray =
+    MessageDigest.getInstance("SHA-256").digest(
+        buildString(method.length + rawParams.length + 1) {
+            append(method)
+            append('\u0000')
+            append(rawParams)
+        }.toByteArray(Charsets.UTF_8),
+    )
 
 internal fun trackedServerRequestResolvedEvent(
     requests: OutstandingApprovalRequests,
     params: JsonObject,
-): AppServerEvent {
+): AppServerEvent? {
     val threadId = params.strictNonBlankString("threadId")
     val requestId = params["requestId"]?.let(CodexRpcClient::parseRequestId)
-    if (threadId == null || requestId == null || !requests.resolve(requestId, threadId)) {
+    if (threadId == null || requestId == null) {
         requests.invalidate()
         return AppServerEvent.FatalProtocolError(
             "Remote sent an invalid or unexpected approval resolution; disconnected without responding.",
         )
     }
-    return AppServerEvent.ApprovalResolved(threadId, requestId)
+    return when (requests.resolveOrIgnore(requestId, threadId)) {
+        OutstandingApprovalRequests.Resolution.RESOLVED -> AppServerEvent.ApprovalResolved(threadId, requestId)
+        OutstandingApprovalRequests.Resolution.UNKNOWN -> null
+        OutstandingApprovalRequests.Resolution.REJECTED -> AppServerEvent.FatalProtocolError(
+            "Remote changed the ownership or state of an approval resolution; disconnected without responding.",
+        )
+    }
 }
 
 class CodexRpcClient(
@@ -363,6 +457,7 @@ class CodexRpcClient(
             platformFamily = result.string("platformFamily") ?: transport.remotePlatform.name.lowercase(),
             platformOs = result.string("platformOs") ?: transport.remotePlatform.name.lowercase(),
             codexVersion = transport.codexVersion,
+            sharedDaemon = transport.sharedDaemon,
         )
     }
 
@@ -770,6 +865,7 @@ class CodexRpcClient(
         collaborationMode: RemoteCollaborationMode?,
         mentions: List<ComposerMention> = emptyList(),
         attachments: List<ComposerImageAttachment> = emptyList(),
+        clientUserMessageId: String? = null,
     ): String? {
         val result = request(
             "turn/start",
@@ -786,6 +882,7 @@ class CodexRpcClient(
                 collaborationMode,
                 mentions,
                 attachments,
+                clientUserMessageId,
             ),
         )
         return startedTurnId(result)
@@ -797,10 +894,11 @@ class CodexRpcClient(
         text: String,
         mentions: List<ComposerMention> = emptyList(),
         attachments: List<ComposerImageAttachment> = emptyList(),
+        clientUserMessageId: String? = null,
     ) {
         request(
             "turn/steer",
-            turnSteerParams(threadId, expectedTurnId, text, mentions, attachments),
+            turnSteerParams(threadId, expectedTurnId, text, mentions, attachments, clientUserMessageId),
         )
     }
 
@@ -863,9 +961,7 @@ class CodexRpcClient(
     private suspend fun send(message: JsonObject) = writeMutex.withLock {
         if (protocolTerminationStarted.get()) throw RpcException("Remote connection is closed")
         withContext(Dispatchers.IO) {
-            transport.writer.write(json.encodeToString(JsonObject.serializer(), message))
-            transport.writer.newLine()
-            transport.writer.flush()
+            transport.writeMessage(json.encodeToString(JsonObject.serializer(), message))
         }
     }
 
@@ -873,11 +969,18 @@ class CodexRpcClient(
         try {
             while (true) {
                 val line = try {
-                    transport.reader.readBoundedLine(MAX_APP_SERVER_LINE_CHARS)
-                } catch (_: AppServerLineTooLongException) {
+                    transport.readMessage(MAX_APP_SERVER_LINE_CHARS)
+                } catch (_: AppServerMessageTooLongException) {
                     terminateForProtocolError(
                         AppServerEvent.FatalProtocolError(
                             "Remote app-server message exceeded the safe size limit; disconnected.",
+                        ),
+                    )
+                    return
+                } catch (_: AppServerMessageProtocolException) {
+                    terminateForProtocolError(
+                        AppServerEvent.FatalProtocolError(
+                            "Remote app-server transport violated the message protocol; disconnected safely.",
                         ),
                     )
                     return
@@ -997,6 +1100,7 @@ class CodexRpcClient(
             "serverRequest/resolved" -> {
                 when (val event = trackedServerRequestResolvedEvent(outstandingApprovalRequests, params)) {
                     is AppServerEvent.FatalProtocolError -> terminateForProtocolError(event)
+                    null -> Unit
                     else -> _events.emit(event)
                 }
             }
@@ -1112,7 +1216,8 @@ class CodexRpcClient(
     }
 
     private suspend fun handleServerRequest(id: RpcRequestId, method: String, params: JsonObject): Boolean {
-        return when (val event = trackedServerRequestEvent(outstandingApprovalRequests, id, method, params)) {
+        val event = trackedServerRequestEvent(outstandingApprovalRequests, id, method, params) ?: return true
+        return when (event) {
             is AppServerEvent.FatalProtocolError -> {
                 terminateForProtocolError(event)
                 false
@@ -1491,6 +1596,7 @@ class CodexRpcClient(
             collaborationMode: RemoteCollaborationMode? = null,
             mentions: List<ComposerMention>,
             attachments: List<ComposerImageAttachment> = emptyList(),
+            clientUserMessageId: String? = null,
         ): JsonObject = buildJsonObject {
             put("threadId", threadId)
             if (cwd.isNotBlank()) put("cwd", cwd)
@@ -1507,6 +1613,7 @@ class CodexRpcClient(
             if (collaborationMode != null && !model.isNullOrBlank()) {
                 put("collaborationMode", collaborationModeParam(collaborationMode, model, reasoningEffort))
             }
+            if (!clientUserMessageId.isNullOrBlank()) put("clientUserMessageId", clientUserMessageId)
             put("input", userInputs(text, mentions, attachments))
         }
 
@@ -1516,9 +1623,11 @@ class CodexRpcClient(
             text: String,
             mentions: List<ComposerMention>,
             attachments: List<ComposerImageAttachment>,
+            clientUserMessageId: String? = null,
         ): JsonObject = buildJsonObject {
             put("threadId", threadId)
             put("expectedTurnId", expectedTurnId)
+            if (!clientUserMessageId.isNullOrBlank()) put("clientUserMessageId", clientUserMessageId)
             put("input", userInputs(text, mentions, attachments))
         }
 
@@ -1746,6 +1855,8 @@ class CodexRpcClient(
                         }
                     }.joinToString("\n"),
                     isGoal = item.boolean("goal"),
+                    clientId = item.strictNonBlankString("clientId")
+                        ?.takeIf { it.length <= MAX_CLIENT_USER_MESSAGE_ID_CHARS },
                 )
                 "agentMessage" -> TimelineItem(id, TimelineKind.AGENT, body = item.string("text").orEmpty())
                 "reasoning" -> TimelineItem(
@@ -1887,6 +1998,7 @@ internal const val MAX_APPROVAL_OPTIONS_PER_QUESTION = 32
 internal const val MAX_TRACKED_APPROVAL_REQUESTS = 256
 internal const val MAX_TRACKED_APPROVAL_ID_CHARS = 1L * 1024L * 1024L
 internal const val MAX_TRACKED_APPROVAL_RETAINED_CHARS = 4L * 1024L * 1024L
+internal const val MAX_CLIENT_USER_MESSAGE_ID_CHARS = 4 * 1024
 private const val MAX_DIAGNOSTIC_CHARS = 4_096
 
 private val NEW_COMMAND_APPROVAL_KEYS = setOf(

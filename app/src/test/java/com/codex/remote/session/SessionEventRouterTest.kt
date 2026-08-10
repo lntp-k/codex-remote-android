@@ -59,6 +59,137 @@ class SessionEventRouterTest {
     }
 
     @Test
+    fun desktopUserMessageWithTheSameBodyDoesNotReplaceThePhoneOptimisticItem() {
+        var registry = registryWith("thread-a")
+        registry = registry.updateSession("thread-a", markUnread = false) { session ->
+            session.copy(
+                timeline = listOf(
+                    TimelineItem(
+                        id = "local-phone",
+                        kind = TimelineKind.USER,
+                        body = "same text",
+                    ),
+                ),
+            )
+        }.requireApplied()
+        registry = routeApplied(registry, SessionEvent.TurnStarted("thread-a", "turn-desktop"))
+
+        val routed = SessionEventRouter.route(
+            registry,
+            SessionEvent.ItemUpsert(
+                "thread-a",
+                TimelineItem(
+                    id = "desktop-item",
+                    kind = TimelineKind.USER,
+                    body = "same text",
+                    turnId = "turn-desktop",
+                    clientId = "desktop-client",
+                ),
+            ),
+        )
+
+        assertTrue(routed.disposition is SessionRouteDisposition.Applied)
+        assertEquals(
+            listOf("local-phone", "desktop-item"),
+            routed.registry.sessions.getValue("thread-a").timeline.map(TimelineItem::id),
+        )
+    }
+
+    @Test
+    fun matchingClientIdReplacesOnlyTheExactPhoneOptimisticItem() {
+        var registry = registryWith("thread-a")
+        registry = registry.updateSession("thread-a", markUnread = false) { session ->
+            session.copy(
+                timeline = listOf(
+                    TimelineItem(id = "local-other", kind = TimelineKind.USER, body = "same text"),
+                    TimelineItem(id = "local-phone", kind = TimelineKind.USER, body = "same text"),
+                ),
+            )
+        }.requireApplied()
+        registry = routeApplied(registry, SessionEvent.TurnStarted("thread-a", "turn-phone"))
+
+        val canonical = TimelineItem(
+            id = "canonical-phone",
+            kind = TimelineKind.USER,
+            body = "same text",
+            turnId = "turn-phone",
+            clientId = "local-phone",
+        )
+        val routed = SessionEventRouter.route(
+            registry,
+            SessionEvent.ItemUpsert("thread-a", canonical),
+        )
+
+        assertTrue(routed.disposition is SessionRouteDisposition.Applied)
+        assertEquals(
+            listOf("local-other", "canonical-phone"),
+            routed.registry.sessions.getValue("thread-a").timeline.map(TimelineItem::id),
+        )
+    }
+
+    @Test
+    fun missingClientIdNeverClaimsAPhoneOptimisticItemByBody() {
+        var registry = registryWith("thread-a")
+        registry = registry.updateSession("thread-a", markUnread = false) { session ->
+            session.copy(
+                timeline = listOf(
+                    TimelineItem(id = "local-phone", kind = TimelineKind.USER, body = "same text"),
+                ),
+            )
+        }.requireApplied()
+        registry = routeApplied(registry, SessionEvent.TurnStarted("thread-a", "turn-desktop"))
+
+        val routed = SessionEventRouter.route(
+            registry,
+            SessionEvent.ItemUpsert(
+                "thread-a",
+                TimelineItem(
+                    id = "desktop-item",
+                    kind = TimelineKind.USER,
+                    body = "same text",
+                    turnId = "turn-desktop",
+                ),
+            ),
+        )
+
+        assertTrue(routed.disposition is SessionRouteDisposition.Applied)
+        assertEquals(
+            listOf("local-phone", "desktop-item"),
+            routed.registry.sessions.getValue("thread-a").timeline.map(TimelineItem::id),
+        )
+    }
+
+    @Test
+    fun canonicalReplayRemovesAnAlreadyCoexistingMatchingPlaceholder() {
+        val canonical = TimelineItem(
+            id = "canonical-phone",
+            kind = TimelineKind.USER,
+            body = "phone text",
+            turnId = "turn-phone",
+            clientId = "local-phone",
+        )
+        var registry = registryWith("thread-a")
+        registry = routeApplied(registry, SessionEvent.TurnStarted("thread-a", "turn-phone"))
+        registry = registry.updateSession("thread-a", markUnread = false) { session ->
+            session.copy(
+                timeline = listOf(
+                    canonical,
+                    TimelineItem(id = "local-phone", kind = TimelineKind.USER, body = "phone text"),
+                ),
+            )
+        }.requireApplied()
+
+        val routed = SessionEventRouter.route(
+            registry,
+            SessionEvent.ItemUpsert("thread-a", canonical.copy(status = "completed")),
+        )
+
+        assertTrue(routed.disposition is SessionRouteDisposition.Applied)
+        assertEquals(listOf("canonical-phone"), routed.registry.sessions.getValue("thread-a").timeline.map(TimelineItem::id))
+        assertEquals("completed", routed.registry.sessions.getValue("thread-a").timeline.single().status)
+    }
+
+    @Test
     fun missingAndUnknownThreadIdsRejectWithoutChangingCachedSessions() {
         val original = registryWith("thread-a").selectThread("thread-a").requireApplied()
 

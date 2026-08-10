@@ -40,15 +40,53 @@ class SshConfigTest {
             "exec \"\${SHELL:-/bin/sh}\" -lc 'codex --version'",
             codexVersionCommand(RemotePlatform.POSIX),
         )
-        assertTrue(appServerCommand(RemotePlatform.POSIX).contains("-lc 'exec codex app-server"))
+        assertTrue(daemonVersionCommand(RemotePlatform.POSIX).contains("-lc 'codex app-server daemon version'"))
+        assertTrue(daemonStartCommand(RemotePlatform.POSIX).contains("-lc 'codex app-server daemon start'"))
+        assertTrue(
+            appServerCommand(RemotePlatform.POSIX, AppServerConnectionMode.SHARED_DAEMON)
+                .contains("-lc 'exec codex app-server proxy'"),
+        )
+        assertTrue(
+            appServerCommand(RemotePlatform.POSIX, AppServerConnectionMode.ISOLATED_STDIO)
+                .contains("-lc 'exec codex app-server --listen stdio://'"),
+        )
     }
 
     @Test
     fun windowsCommandAllowsTheRemotePowerShellProfile() {
-        val command = appServerCommand(RemotePlatform.WINDOWS)
+        val isolated = appServerCommand(RemotePlatform.WINDOWS, AppServerConnectionMode.ISOLATED_STDIO)
+        val shared = appServerCommand(RemotePlatform.WINDOWS, AppServerConnectionMode.SHARED_DAEMON)
 
-        assertTrue(command.contains("powershell.exe"))
-        assertFalse(command.contains("-NoProfile"))
-        assertTrue(command.contains("codex app-server --listen stdio://"))
+        assertTrue(isolated.contains("powershell.exe"))
+        assertFalse(isolated.contains("-NoProfile"))
+        assertTrue(isolated.contains("codex app-server --listen stdio://"))
+        assertTrue(shared.contains("codex app-server proxy"))
+        assertFalse(shared.contains("-NoProfile"))
+    }
+
+    @Test
+    fun daemonProbeRequiresAValidRunningStatusObject() {
+        val status = parseSharedDaemonStatus(
+            """{"status":"running","cliVersion":"0.145.0","appServerVersion":"0.145.0"}""",
+        )
+
+        assertTrue(status?.running == true)
+        assertEquals("0.145.0", status?.cliVersion)
+        assertEquals("0.145.0", status?.appServerVersion)
+        assertTrue(status?.isCompatibleWith("0.145.0") == true)
+        assertFalse(status?.isCompatibleWith("0.144.0") == true)
+        assertFalse(parseSharedDaemonStatus("""{"status":"running"}""")?.isCompatibleWith("0.145.0") == true)
+        assertEquals(
+            "0.145.0",
+            servingCodexVersion(AppServerConnectionMode.SHARED_DAEMON, "0.146.0", status),
+        )
+        assertEquals(
+            "0.146.0",
+            servingCodexVersion(AppServerConnectionMode.ISOLATED_STDIO, "0.146.0", status),
+        )
+        assertTrue(daemonReportsRunning("""{"status":"running","socketPath":"/tmp/codex.sock"}"""))
+        assertTrue(daemonReportsRunning("warning\n  {\"status\": \"running\"}\n"))
+        assertFalse(daemonReportsRunning("""{"status":"stopped"}"""))
+        assertFalse(daemonReportsRunning("not json\n{\"status\":"))
     }
 }

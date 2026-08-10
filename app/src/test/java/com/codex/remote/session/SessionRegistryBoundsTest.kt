@@ -539,6 +539,22 @@ class SessionRegistryBoundsTest {
     }
 
     @Test
+    fun timelineRetentionCountsThePeerControlledClientMessageId() {
+        val item = TimelineItem(
+            id = "item",
+            kind = TimelineKind.USER,
+            body = "body",
+            turnId = "turn",
+            clientId = "client-origin",
+        )
+
+        assertEquals(
+            listOf("item", "body", "turn", "client-origin").sumOf(String::length).toLong(),
+            item.retainedCharacterCount(),
+        )
+    }
+
+    @Test
     fun retainedStateArithmeticSaturatesEveryAggregateDimension() {
         val saturated = SessionRetainedState(
             retainedChars = Long.MAX_VALUE - 1,
