@@ -38,6 +38,9 @@ jobs:
           CODEX_REMOTE_KEY_PASSWORD: ""
         run: |
           chmod +x gradlew
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          test -x "$BUILD_TOOLS/zipalign"
+          test -x "$BUILD_TOOLS/apksigner"
           ./gradlew --no-daemon --console=plain --warning-mode=all \
             clean \
             testDebugUnitTest \
@@ -53,12 +56,12 @@ jobs:
           unzip -tqq app/build/outputs/apk/debug/app-debug.apk
           unzip -tqq app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
           unzip -tqq app/build/outputs/apk/release/app-release-unsigned.apk
-          zipalign -c -P 16 -v 4 app/build/outputs/apk/debug/app-debug.apk
-          zipalign -c -P 16 -v 4 app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-          zipalign -c -P 16 -v 4 app/build/outputs/apk/release/app-release-unsigned.apk
-          apksigner verify --verbose app/build/outputs/apk/debug/app-debug.apk
-          apksigner verify --verbose app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-          if apksigner verify app/build/outputs/apk/release/app-release-unsigned.apk >/dev/null 2>&1; then
+          "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 app/build/outputs/apk/debug/app-debug.apk
+          "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 app/build/outputs/apk/release/app-release-unsigned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          if "$BUILD_TOOLS/apksigner" verify app/build/outputs/apk/release/app-release-unsigned.apk >/dev/null 2>&1; then
             echo "Expected the CI release artifact to remain unsigned" >&2
             exit 1
           fi
