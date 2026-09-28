@@ -917,6 +917,7 @@ val answer = 42
                     onTrustHostKey = {},
                     onRejectHostKey = {},
                     onDismissNotice = {},
+                    onExportLogs = {},
                 )
             }
         }

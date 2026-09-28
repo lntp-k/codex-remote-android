@@ -38,6 +38,7 @@ class ConnectionsScreenHostTest {
                     onSave = { _, _ -> },
                     onCloseEditor = {},
                     onDismissNotice = {},
+                    onExportLogs = {},
                 )
             }
         }
@@ -70,6 +71,7 @@ class ConnectionsScreenHostTest {
                     onSave = { _, _ -> },
                     onCloseEditor = {},
                     onDismissNotice = {},
+                    onExportLogs = {},
                 )
             }
         }
