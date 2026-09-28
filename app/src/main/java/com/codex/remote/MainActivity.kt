@@ -23,10 +23,14 @@ class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
+    private val storagePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val appViewModel = (application as CodexRemoteApplication).appViewModel
+        requestLegacyStoragePermissionIfNeeded()
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -56,6 +60,20 @@ class MainActivity : ComponentActivity() {
         ) {
             notificationPermissionRequested = true
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    /**
+     * On Android 9 (API 28) and below, writing to the public Downloads folder requires this
+     * permission up front; Android 10+ uses MediaStore instead and needs no permission.
+     */
+    private fun requestLegacyStoragePermissionIfNeeded() {
+        if (
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         }
     }
 }

@@ -57,6 +57,7 @@ import androidx.compose.material.icons.automirrored.outlined.List
 import androidx.compose.material.icons.automirrored.outlined.Send
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Archive
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.AttachFile
 import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Check
@@ -239,6 +240,7 @@ fun WorkspaceScreen(
     onTrustHostKey: () -> Unit,
     onRejectHostKey: () -> Unit,
     onDismissNotice: () -> Unit,
+    onExportLogs: () -> Unit,
 ) {
     val drawerState = androidx.compose.material3.rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -274,6 +276,7 @@ fun WorkspaceScreen(
                         onLoadArchivedThreads()
                     },
                     onOpenConnections = onOpenConnections,
+                    onExportLogs = onExportLogs,
                 )
                 HorizontalDivider(Modifier.fillMaxHeight().width(1.dp))
                 WorkspaceContent(
@@ -346,6 +349,10 @@ fun WorkspaceScreen(
                             onOpenConnections = {
                                 scope.launch { drawerState.close() }
                                 onOpenConnections()
+                            },
+                            onExportLogs = {
+                                scope.launch { drawerState.close() }
+                                onExportLogs()
                             },
                         )
                     }
@@ -486,6 +493,7 @@ private fun WorkspaceSidebar(
     onSetThreadPinned: (RemoteThread, Boolean) -> Unit,
     onOpenArchivedTasks: () -> Unit,
     onOpenConnections: () -> Unit,
+    onExportLogs: () -> Unit,
 ) {
     val expandedProjects = remember(state.activeConnection?.id) { mutableStateMapOf<String, Boolean>() }
     var searchQuery by remember(state.activeConnection?.id) { mutableStateOf("") }
@@ -514,6 +522,7 @@ private fun WorkspaceSidebar(
         }
         SidebarAction(Icons.Outlined.Add, "New task", onNewThread)
         SidebarAction(Icons.Outlined.Archive, "Archived tasks", onOpenArchivedTasks)
+        SidebarAction(Icons.Outlined.Download, "Export logs", onExportLogs)
         OutlinedTextField(
             value = searchQuery,
             onValueChange = { searchQuery = it },

@@ -8,6 +8,7 @@ import com.codex.remote.domain.AuthType
 import com.codex.remote.domain.ConnectionSecrets
 import com.codex.remote.domain.RemotePlatform
 import com.codex.remote.domain.SavedConnection
+import com.codex.remote.logging.AppLog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -124,19 +125,25 @@ class SshAppServerTransportFactory(private val context: Context) {
         connection: SavedConnection,
         secrets: ConnectionSecrets,
     ): ActiveSshTransport = withContext(Dispatchers.IO) {
+        AppLog.i(TAG, "open host=${connection.host}:${connection.port} auth=${connection.authType} platform=${connection.platform}")
         var observedFingerprint = ""
         val ssh = authenticatedClient(connection, secrets) { observedFingerprint = it }
         try {
             val remotePlatform = resolvePlatform(ssh, connection.platform)
+            AppLog.i(TAG, "platform_resolved platform=$remotePlatform")
             val codexVersion = readCodexVersion(ssh, remotePlatform)
+            AppLog.i(TAG, "codex_version_read version=$codexVersion")
             val sharedDaemonStatus = try {
                 ensureSharedDaemon(ssh, remotePlatform, codexVersion)
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                AppLog.w(TAG, "shared_daemon_probe_failed", error)
                 null
             }
+            AppLog.i(TAG, "shared_daemon_status running=${sharedDaemonStatus?.running == true} version=${sharedDaemonStatus?.appServerVersion}")
             val opened = openAppServer(ssh, remotePlatform, sharedDaemonStatus != null)
             val servingCodexVersion = servingCodexVersion(opened.mode, codexVersion, sharedDaemonStatus)
             ssh.timeout = 0
+            AppLog.i(TAG, "open_succeeded mode=${opened.mode} serving_version=$servingCodexVersion")
             ActiveSshTransport(
                 ssh = ssh,
                 session = opened.session,
@@ -148,6 +155,7 @@ class SshAppServerTransportFactory(private val context: Context) {
                 sharedDaemon = opened.mode == AppServerConnectionMode.SHARED_DAEMON,
             )
         } catch (error: Throwable) {
+            AppLog.e(TAG, "open_failed host=${connection.host}:${connection.port} error=${error::class.java.name}", error)
             runCatching { ssh.disconnect() }
             runCatching { ssh.close() }
             throw error
@@ -170,10 +178,12 @@ class SshAppServerTransportFactory(private val context: Context) {
                 onFingerprint(actual)
                 val expected = connection.hostKeyFingerprint
                 if (expected.isBlank()) {
+                    AppLog.w(TAG, "host_key_unknown fingerprint=$actual")
                     unknownFingerprint = actual
                     return false
                 }
                 if (expected != actual) {
+                    AppLog.e(TAG, "host_key_changed expected=$expected actual=$actual")
                     changedFingerprint = actual
                     return false
                 }
@@ -185,13 +195,16 @@ class SshAppServerTransportFactory(private val context: Context) {
 
         try {
             ssh.connect(connection.host, connection.port)
+            AppLog.i(TAG, "tcp_connected host=${connection.host}:${connection.port}")
             when (connection.authType) {
                 AuthType.PASSWORD -> ssh.authPassword(connection.username, secrets.password)
                 AuthType.PRIVATE_KEY -> authenticatePrivateKey(ssh, connection.username, secrets)
             }
+            AppLog.i(TAG, "authenticated user=${connection.username} auth=${connection.authType}")
             configureProtocolKeepAlive(ssh)
             return ssh
         } catch (error: Throwable) {
+            AppLog.e(TAG, "connect_or_auth_failed host=${connection.host}:${connection.port} error=${error::class.java.name}", error)
             runCatching { ssh.disconnect() }
             runCatching { ssh.close() }
             unknownFingerprint?.let { throw UnknownHostKeyException(it) }
@@ -245,6 +258,7 @@ class SshAppServerTransportFactory(private val context: Context) {
             val detail = probe.stderr.lineSequence().lastOrNull { it.isNotBlank() }
                 ?: probe.stdout.lineSequence().lastOrNull { it.isNotBlank() }
                 ?: "codex --version returned no version"
+            AppLog.e(TAG, "codex_version_probe_failed exit=${probe.exitStatus} stdout=${probe.stdout.trim()} stderr=${probe.stderr.trim()}")
             throw RemoteCodexUnavailableException(
                 "No usable Codex CLI was found in the remote login shell. Run codex --version on the remote host and complete installation first. $detail",
             )
@@ -357,6 +371,7 @@ class SshAppServerTransportFactory(private val context: Context) {
 
     companion object {
         private const val PROBE_TIMEOUT_SECONDS = 15L
+        private const val TAG = "SshAppServerTransport"
     }
 }
 
