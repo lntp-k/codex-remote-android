@@ -27,6 +27,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Lock
@@ -86,6 +87,7 @@ fun ConnectionsScreen(
     onSave: (ConnectionDraft, Boolean) -> Unit,
     onCloseEditor: () -> Unit,
     onDismissNotice: () -> Unit,
+    onExportLogs: () -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     var pendingDelete by remember { mutableStateOf<SavedConnection?>(null) }
@@ -110,6 +112,9 @@ fun ConnectionsScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onExportLogs) {
+                        Icon(Icons.Outlined.Download, contentDescription = "Export logs")
+                    }
                     IconButton(onClick = onAdd) {
                         Icon(Icons.Outlined.Add, contentDescription = "Add connection")
                     }

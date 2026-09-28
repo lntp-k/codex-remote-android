@@ -22,6 +22,7 @@ import com.codex.remote.AppViewModel
 import com.codex.remote.CodexRemoteApplication
 import com.codex.remote.MainActivity
 import com.codex.remote.R
+import com.codex.remote.logging.AppLog
 
 /**
  * Keeps a user-requested SSH session alive independently of Activity lifetime.
@@ -106,6 +107,7 @@ class SshConnectionService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        AppLog.i(SERVICE_LOG_TAG, "onCreate")
         isRunning = true
         powerManager = getSystemService(PowerManager::class.java)
         createNotificationChannel()
@@ -138,6 +140,7 @@ class SshConnectionService : Service() {
     }
 
     override fun onDestroy() {
+        AppLog.i(SERVICE_LOG_TAG, "onDestroy")
         isRunning = false
         if (networkCallbackRegistered) {
             runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
@@ -252,6 +255,7 @@ class SshConnectionService : Service() {
         @Volatile
         private var isRunning = false
 
+        private const val SERVICE_LOG_TAG = "SshConnectionService"
         private const val ACTION_START = "com.codex.remote.connection.action.START"
         private const val ACTION_DISCONNECT = "com.codex.remote.connection.action.DISCONNECT"
         private const val NOTIFICATION_CHANNEL_ID = "ssh_connection"
@@ -266,15 +270,18 @@ class SshConnectionService : Service() {
             return try {
                 ContextCompat.startForegroundService(context, intent)
                 true
-            } catch (_: SecurityException) {
+            } catch (error: SecurityException) {
+                AppLog.e(SERVICE_LOG_TAG, "start_failed reason=security_exception", error)
                 false
             } catch (error: RuntimeException) {
                 if (
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                     error::class.java.name == "android.app.ForegroundServiceStartNotAllowedException"
                 ) {
+                    AppLog.e(SERVICE_LOG_TAG, "start_failed reason=fgs_start_not_allowed", error)
                     false
                 } else {
+                    AppLog.e(SERVICE_LOG_TAG, "start_failed reason=unexpected", error)
                     throw error
                 }
             }

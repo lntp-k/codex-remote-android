@@ -4,7 +4,6 @@ import android.app.Application
 import android.net.ConnectivityManager
 import android.os.PowerManager
 import android.os.SystemClock
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.codex.remote.data.rpc.AppServerEvent
@@ -60,6 +59,9 @@ import com.codex.remote.domain.composerToken
 import com.codex.remote.domain.containsComposerToken
 import com.codex.remote.domain.withThreadArchived
 import com.codex.remote.domain.withThreadRenamed
+import com.codex.remote.logging.AppLog
+import com.codex.remote.logging.LogExportResult
+import com.codex.remote.logging.LogExporter
 import com.codex.remote.session.OwnedApproval
 import com.codex.remote.session.ResumeEventCoordinator
 import com.codex.remote.session.ResumeEventDrainDisposition
@@ -148,7 +150,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         if (desiredConnectionId != null) {
                             if (desired == null) {
                                 val cleared = maintenanceStore.clear()
-                                Log.e(
+                                AppLog.e(
                                     CONNECTION_LOG_TAG,
                                     "state=maintenance_target_missing clear_persisted=$cleared",
                                 )
@@ -220,7 +222,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun connect(connection: SavedConnection) {
         didRestoreLastConnection = true
         if (!maintenanceStore.remember(connection.id)) {
-            Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_persist_failed")
+            AppLog.e(CONNECTION_LOG_TAG, "state=maintenance_target_persist_failed")
             _state.update { current ->
                 if (
                     current.activeConnection != null &&
@@ -258,7 +260,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (!SshConnectionService.start(getApplication())) {
             shouldMaintainConnection = false
             if (!maintenanceStore.clear()) {
-                Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed reason=fgs_start")
+                AppLog.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed reason=fgs_start")
             }
             disconnectInternal(clearActive = true)
             _state.update {
@@ -477,7 +479,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         delay(RECONNECT_STABILITY_WINDOW_MILLIS)
                         if (rpc === attemptClient && _state.value.connectionStatus == ConnectionStatus.CONNECTED) {
                             reconnectAttempts.reset()
-                            Log.i(CONNECTION_LOG_TAG, "state=stable reconnect_attempt_reset=true")
+                            AppLog.i(CONNECTION_LOG_TAG, "state=stable reconnect_attempt_reset=true")
                         }
                     }
                 } else {
@@ -500,6 +502,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 eventJob = null
                 closeClientInBackground(rpc)
                 rpc = null
+                AppLog.e(
+                    CONNECTION_LOG_TAG,
+                    "state=connect_attempt_failed error=${error::class.java.name} detail=${error.message}",
+                    error,
+                )
                 val unknownHostKey = generateSequence(error) { it.cause }
                     .filterIsInstance<UnknownHostKeyException>()
                     .firstOrNull()
@@ -516,6 +523,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     scheduleReconnect(friendlyError(error))
                 } else {
                     suspendConnectionMaintenance()
+                    // Terminal connection failure the user can't recover from automatically:
+                    // capture the detailed log now, before context that explains it is lost.
+                    LogExporter.exportAsync(getApplication(), reason = "connection_error")
                     _state.update {
                         it.copy(
                             connectionStatus = ConnectionStatus.ERROR,
@@ -560,6 +570,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Manually copies the current detailed log into Downloads/CodexRemote for the user to pull off-device. */
+    fun exportLogs() {
+        viewModelScope.launch {
+            val result = LogExporter.export(getApplication(), reason = "manual")
+            _state.update {
+                it.copy(
+                    notice = when (result) {
+                        is LogExportResult.Success -> "Logs exported to ${result.label}"
+                        is LogExportResult.Failure -> "Log export failed: ${result.reason}"
+                    },
+                )
+            }
+        }
+    }
+
     fun onDefaultNetworkAvailable(networkId: Long) {
         viewModelScope.launch {
             hasObservedNetworkState = true
@@ -567,7 +592,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val connection = _state.value.activeConnection ?: return@launch
             if (!shouldMaintainConnection) return@launch
             if (isDeviceIdleMode) {
-                Log.i(CONNECTION_LOG_TAG, "state=network_available recovery_deferred=device_idle")
+                AppLog.i(CONNECTION_LOG_TAG, "state=network_available recovery_deferred=device_idle")
                 return@launch
             }
             val availableNetworkMayRequireHandoff = when (transition) {
@@ -583,7 +608,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (availableNetworkMayRequireHandoff && connectionJob?.isActive == true) {
                 networkHandoffPending = true
-                Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=connection_attempt")
+                AppLog.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=connection_attempt")
             }
             val recoveryAction = if (
                 transition == NetworkTransition.INITIAL &&
@@ -612,7 +637,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     if (reconnectCircuitBreakerPaused) {
                         reconnectAttempts.reset()
                         reconnectCircuitBreakerPaused = false
-                        Log.i(CONNECTION_LOG_TAG, "state=reconnect_circuit_breaker_reset reason=network_change")
+                        AppLog.i(CONNECTION_LOG_TAG, "state=reconnect_circuit_breaker_reset reason=network_change")
                     }
                     scheduleReconnect(
                         message = "Network available; restoring the SSH session",
@@ -638,7 +663,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (_state.value.connectionStatus == ConnectionStatus.RECONNECTING) {
                 _state.update { it.copy(connectionMessage = "Waiting for a network…") }
             }
-            Log.i(CONNECTION_LOG_TAG, "state=network_unavailable")
+            AppLog.i(CONNECTION_LOG_TAG, "state=network_unavailable")
         }
     }
 
@@ -660,7 +685,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 }
-                Log.i(CONNECTION_LOG_TAG, "state=device_idle reconnect_deferred=true")
+                AppLog.i(CONNECTION_LOG_TAG, "state=device_idle reconnect_deferred=true")
                 return@launch
             }
 
@@ -686,7 +711,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     connection = connection,
                 )
             }
-            Log.i(CONNECTION_LOG_TAG, "state=device_awake recovery_checked=true")
+            AppLog.i(CONNECTION_LOG_TAG, "state=device_awake recovery_checked=true")
         }
     }
 
@@ -724,7 +749,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 if (!deferWasLogged) {
-                    Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
+                    AppLog.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
                     deferWasLogged = true
                 }
                 delay(NETWORK_HANDOFF_RECHECK_MILLIS)
@@ -755,7 +780,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             currentNetworkHandoffDisposition() == NetworkHandoffDisposition.DEFER &&
             !canOverridePendingRpc
         ) {
-            Log.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
+            AppLog.i(CONNECTION_LOG_TAG, "state=network_handoff_deferred reason=protected_work")
             return
         }
         if (suspendForAmbiguousApprovalDelivery()) return
@@ -813,7 +838,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         reconnectAttempts.reset()
         pendingReconnectSelection = null
         if (!maintenanceStore.clear()) {
-            Log.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed")
+            AppLog.e(CONNECTION_LOG_TAG, "state=maintenance_target_clear_failed")
         }
         SshConnectionService.stop(getApplication())
     }
@@ -842,7 +867,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 notice = message,
             )
         }
-        Log.w(CONNECTION_LOG_TAG, "state=suspended reason=approval_delivery_ambiguous")
+        AppLog.w(CONNECTION_LOG_TAG, "state=suspended reason=approval_delivery_ambiguous")
         return true
     }
 
@@ -871,7 +896,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         notice = message,
                     )
                 }
-                Log.i(CONNECTION_LOG_TAG, "state=waiting_for_device_wake reason=retry_requested")
+                AppLog.i(CONNECTION_LOG_TAG, "state=waiting_for_device_wake reason=retry_requested")
                 return
             }
             ReconnectReadiness.WAITING_FOR_NETWORK -> {
@@ -883,7 +908,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         notice = message,
                     )
                 }
-                Log.i(CONNECTION_LOG_TAG, "state=waiting_for_network reason=retry_requested")
+                AppLog.i(CONNECTION_LOG_TAG, "state=waiting_for_network reason=retry_requested")
                 return
             }
             ReconnectReadiness.READY -> Unit
@@ -901,7 +926,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     notice = pausedMessage,
                 )
             }
-            Log.w(CONNECTION_LOG_TAG, "state=suspended reason=reconnect_circuit_breaker")
+            AppLog.w(CONNECTION_LOG_TAG, "state=suspended reason=reconnect_circuit_breaker")
             return
         }
         val delayMillis = if (immediate) {
@@ -918,7 +943,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 notice = message,
             )
         }
-        Log.i(
+        AppLog.i(
             CONNECTION_LOG_TAG,
             "state=reconnect_scheduled attempt=$attempt delay_ms=$delayMillis",
         )
@@ -932,11 +957,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 isDeviceIdleMode ||
                 sessionRequestTracker.connectionGeneration != scheduledConnectionGeneration
             ) {
-                Log.i(CONNECTION_LOG_TAG, "state=reconnect_skipped reason=stale_timer")
+                AppLog.i(CONNECTION_LOG_TAG, "state=reconnect_skipped reason=stale_timer")
                 return@launch
             }
             if (!reconnectAttempts.markStarted(attempt)) return@launch
-            Log.i(CONNECTION_LOG_TAG, "state=reconnect_started attempt=$attempt")
+            AppLog.i(CONNECTION_LOG_TAG, "state=reconnect_started attempt=$attempt")
             startConnectionAttempt(target, isReconnect = true)
         }
     }
@@ -2638,7 +2663,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         connectionGeneration: Long,
     ) {
         if (!isCurrentConnection(client, connectionGeneration)) return
-        Log.e(CONNECTION_LOG_TAG, "state=resume_event_overflow action=disconnect")
+        AppLog.e(CONNECTION_LOG_TAG, "state=resume_event_overflow action=disconnect")
         disconnectInternal(clearActive = false)
         _state.update { state ->
             state.copy(
@@ -2831,7 +2856,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                     if (suspendForAmbiguousApprovalDelivery()) return
                                     if (hadUnconfirmedWork) {
                                         reconnectHadUnconfirmedWork = true
-                                        Log.w(
+                                        AppLog.w(
                                             CONNECTION_LOG_TAG,
                                             "state=transport_interrupted in_flight_work_unconfirmed=true",
                                         )

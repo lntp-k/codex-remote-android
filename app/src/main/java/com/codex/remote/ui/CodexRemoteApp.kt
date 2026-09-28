@@ -32,6 +32,7 @@ fun CodexRemoteApp(viewModel: AppViewModel) {
             onSave = viewModel::saveConnection,
             onCloseEditor = viewModel::closeEditor,
             onDismissNotice = viewModel::clearNotice,
+            onExportLogs = viewModel::exportLogs,
         )
     } else {
         WorkspaceScreen(
@@ -77,6 +78,7 @@ fun CodexRemoteApp(viewModel: AppViewModel) {
             onTrustHostKey = viewModel::trustPendingHostKey,
             onRejectHostKey = viewModel::rejectPendingHostKey,
             onDismissNotice = viewModel::clearNotice,
+            onExportLogs = viewModel::exportLogs,
         )
     }
 }

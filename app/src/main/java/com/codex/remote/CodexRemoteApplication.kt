@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.ViewModelStoreOwner
+import com.codex.remote.logging.AppLog
 
 /**
  * Process-wide owner for state that must survive Activity recreation and remain
@@ -11,6 +12,12 @@ import androidx.lifecycle.ViewModelStoreOwner
  */
 class CodexRemoteApplication : Application(), ViewModelStoreOwner {
     override val viewModelStore: ViewModelStore = ViewModelStore()
+
+    override fun onCreate() {
+        super.onCreate()
+        AppLog.init(this)
+        AppLog.installCrashHandler(this)
+    }
 
     val appViewModel: AppViewModel by lazy {
         ViewModelProvider(
