@@ -899,3 +899,12 @@ APK-copy records in two verification documents. Kotlin source, test source,
 Gradle settings and runtime image remained unchanged; build evidence above
 is reused for those unchanged inputs. The documentation itself is checked by
 diff validation and the review recorder's document-claims check.
+
+## Session closeout — 2026-10-07
+
+Current status, source/derived-file boundaries and regeneration hashes,
+deadlines, verified versus unverified facts, decision record, next actions,
+user decisions, complete anomaly accounting and the original checkout's
+append-only notes are consolidated in [SESSION_HANDOFF_20261007.md](SESSION_HANDOFF_20261007.md).
+This closes source work on PR #4; the PR remains open and device validation is
+not claimed. Original root worktree and historical APKs are preserved.
