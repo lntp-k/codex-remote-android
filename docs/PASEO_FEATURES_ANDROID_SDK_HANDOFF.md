@@ -881,8 +881,13 @@ comparison; no speedup claim is made.
 
 - 일시: 2026-10-07 (Asia/Seoul). 런타임: Codex.
   도구/훅: independent-review-record --begin / doc-claims.
-  증상(원문): `문서가 스스로 반증하는 주장을 담고 있다 — 고치고 다시 --begin 하라:`
-  `없는 폴더를 현행처럼 가리킨다: ~/coding/codex-remote-android` (APK 기록 3곳).
+  증상: 아래는 훅 진단의 인용이며 현행 경로 주장이 아님 (APK 기록 3곳).
+
+  ```text
+  문서가 스스로 반증하는 주장을 담고 있다 — 고치고 다시 --begin 하라:
+  없는 폴더를 현행처럼 가리킨다: ~/coding/codex-remote-android
+  ```
+
   실측한 대체 수단: 검증 문서가 당시 복사 기록임을 명시하고,
   존재하지 않는 현행 체크아웃 경로 대신 당시 저장소 내 파일명을 보존함.
   현재 APK 존재·해시는 재검증하지 않았다고 명시; 훅·설정은 변경하지 않음.
