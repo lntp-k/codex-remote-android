@@ -812,3 +812,69 @@ The roadmap is complete only when all of the following are true:
   <https://developer.android.com/about/versions/17/setup-sdk>
 - Android 17 target behavior changes:
   <https://developer.android.com/about/versions/17/behavior-changes-17>
+
+## PR #4 log export repair — 2026-10-07
+
+Input: PR head `b515186a5b589ac378262628b3d5326a0b20d304`, base
+`4c7b89a6418920067cb8ca2e2ede05f094cd0e0f`. Changes preserve the logging
+feature while fixing two reviewed failures:
+
+- Capture immutable log contents on the same executor that writes and rotates
+  the files. Reports include retained segments once, oldest to newest. A
+  timeout or read failure returns an export failure instead of reading live files.
+- Give reports UUID-bearing names and atomically create each legacy destination
+  file, so simultaneous Android 26–28 exports cannot overwrite one another.
+  Concurrent first exports can safely share directory creation.
+- Mark the guarded MediaStore helper as requiring API 29; the previous PR
+  failed lint's NewApi check despite the caller's SDK-version guard.
+
+Validation ran in the existing local image
+`sha256:d3768cd434906067cbaa84e333c691e5256571f6dce1db04e5ef7f7cba901f35`
+with SDK `/opt/android-sdk`, JDK 17, and this worktree mounted at `/workspace`.
+No host SDK installation or SDK-path configuration was added to the repository.
+
+```sh
+./gradlew --no-daemon --console=plain \
+  :app:testDebugUnitTest :app:lintDebug :app:assembleDebug \
+  :app:assembleDebugAndroidTest :app:assembleRelease
+```
+
+- Final run: BUILD SUCCESSFUL in 1m 29s; 135 tasks, 28 executed and 107 up-to-date.
+- Unit tests: 290 in 35 suites; zero failures, errors, or skipped tests.
+  Includes three new tests for retention/order, snapshots during rotation,
+  and simultaneous legacy exports with complete separate reports.
+- Lint: zero errors, 22 warnings. Debug, instrumentation-test, and unsigned
+  minified release APKs assembled; APK ZIP integrity passed.
+- Device/emulator execution, real SSH failures, crash-handler export, and
+  on-device Downloads visibility remain unverified. Build proof is not release
+  or installation proof.
+- Independent approval and published SHA are recorded outside this commit in
+  the host merge-gate record and final task report; this section is test evidence.
+
+| Unit | Inputs/dependencies | State/evidence | Reuse/rerun reason |
+| --- | --- | --- | --- |
+| Build environment | Existing pinned Android runtime image | Newly verified: container SDK supports all declared build tasks | Host SDK absent; used existing runtime without changing host configuration |
+| Export repair | PR head, AppLog/LogExporter contract, new tests | Newly verified: serialized snapshots and separate complete legacy reports | Prior source review reused only as defect input; correctness tested against repaired source |
+| Final verification | Final Kotlin sources and same runtime | Newly verified: 290 tests and lint passed; all three APK variants built | First run failed lint (3m 34s); corrected API annotation and test nullability, then reran tasks; Gradle reused unaffected inputs |
+
+SDK investigation ran in parallel with source repair using one read-only
+agent (parent model inherited, token count not exposed). Formal gate review
+uses an independent latest Sol after committing the target. Wall time of the
+first and corrected builds is not a controlled sequential-versus-parallel
+comparison; no speedup claim is made.
+
+## 도구·훅 이상 (별도 진행)
+
+- 일시: 2026-10-07 (Asia/Seoul). 런타임: Codex.
+  도구/훅: SDK 조사 에이전트의 exec_command / Rust-first PreToolUse.
+  증상(원문): `Rust-first 규칙 위반: find -name/-iname/-type/-path/-regex 금지. 권장: fd <pattern> [path] 또는 fd -e <ext> (fd-find).`
+  실측한 대체 수단: fd로 기존 SDK 경로 검색 완료; 기존 Docker 이미지의 SDK로 빌드 성공.
+  [추정] 검색 명령 선택에 대한 정상 정책 차단임.
+  상태: 열림. 훅 변경·우회 없이 조사 완료; 정책/도구 선택 재발 방지는 별도 작업.
+
+- 일시: 2026-10-07 (Asia/Seoul). 런타임: Codex.
+  도구/훅: Gradle SDK provisioning in existing runtime.
+  증상(원문): `WARNING: platform-tools package is not installed, and automatic installation failed.`
+  실측한 대체 수단: 기존 platform 36 및 build-tools로 빌드·단위 테스트·lint 성공.
+  [추정] 컨테이너를 호스트 사용자 UID로 실행하여 이미지 SDK에 추가 설치할 수 없음.
+  상태: 열림. platform-tools 및 기기 실행 환경 구성은 별도 작업이며 이 검증에서 변경하지 않음.

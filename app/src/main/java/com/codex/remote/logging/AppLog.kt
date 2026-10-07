@@ -7,7 +7,6 @@ import java.io.PrintWriter
 import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -52,7 +51,6 @@ object AppLog {
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             runCatching {
                 e("AppLog", "uncaught_exception thread=${thread.name}", throwable)
-                flushSync()
                 LogExporter.exportBlocking(appContext, reason = "crash")
             }
             previousUncaughtHandler?.uncaughtException(thread, throwable)
@@ -109,18 +107,21 @@ object AppLog {
         }
     }
 
-    /** Blocks until every queued write so far has been flushed to disk. Used before an export. */
-    fun flushSync(timeoutMillis: Long = 2_000) {
-        val latch = CountDownLatch(1)
-        writer.execute { latch.countDown() }
-        runCatching { latch.await(timeoutMillis, TimeUnit.MILLISECONDS) }
-    }
-
-    /** Current + rotated log files on disk, oldest content last. */
-    fun logFiles(context: Context): List<File> {
+    /** Reads an immutable, chronological snapshot between queued writes and rotations. */
+    internal fun snapshotBlocking(context: Context, timeoutMillis: Long = 2_000): String {
         val dir = logDir ?: File(context.applicationContext.filesDir, LOG_DIR_NAME)
-        return dir.listFiles { candidate -> candidate.isFile && candidate.name.startsWith(LOG_FILE_NAME) }
-            ?.sortedBy { it.name }
-            ?: emptyList()
+        val snapshot = writer.submit<String> {
+            val files = (MAX_ROTATED_FILES downTo 0).map { index ->
+                File(dir, if (index == 0) LOG_FILE_NAME else "$LOG_FILE_NAME.$index")
+            }.filter { it.isFile && it.length() > 0 }
+            files.joinToString(separator = "\n") { it.readText(Charsets.UTF_8) }
+        }
+        return try {
+            snapshot.get(timeoutMillis, TimeUnit.MILLISECONDS)
+        } catch (error: Exception) {
+            snapshot.cancel(false)
+            if (error is InterruptedException) Thread.currentThread().interrupt()
+            throw error
+        }
     }
 }
