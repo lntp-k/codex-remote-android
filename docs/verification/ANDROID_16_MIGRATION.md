@@ -126,12 +126,16 @@ saved connections survive it.
 
 ### Signed `0.1.7` artifact copies
 
-The following two copies are byte-identical to the validated Gradle output and
-have SHA-256
+The 2026-08-08 report recorded two copies as byte-identical to the validated
+Gradle output with SHA-256
 `fb18519c95a8d51bf4e845858f0cfacfc3c5f9474907ebd482332e0a17d2d440`:
 
-- `/home/jl/coding/codex-remote-android/codex-remote-android-v0.1.7.apk`
+- Repository-local copy: `codex-remote-android-v0.1.7.apk`
 - `/home/jl/mnt/dropbox-personal/codex-remote-android-v0.1.7.apk`
+
+These are historical copy records. The original checkout was named
+`codex-remote-android`; that checkout path does not exist on this host today.
+Current availability and digests of the retained copies have not been reverified.
 
 The retained `0.1.6` APK was not modified. The Dropbox remote reported the
 uploaded object at 3,614,820 bytes; a read-back SHA-256 matched the build
@@ -162,10 +166,13 @@ It remains a QA candidate rather than a device-validated production release.
 | Native ELF alignment | Every 64-bit native-library `PT_LOAD` segment has `p_align = 0x4000` |
 | Independent source review | Two lifecycle/network reviews found no remaining release-blocking source defect |
 
-The following copies were read back as byte-identical:
+The 2026-08-10 report recorded these copies as read back byte-identical:
 
-- `/home/jl/coding/codex-remote-android/codex-remote-android-v0.1.8.apk`
+- Repository-local copy: `codex-remote-android-v0.1.8.apk`
 - `/home/jl/mnt/dropbox-personal/codex-remote-android-v0.1.8.apk`
+
+These are historical copy records from the former `codex-remote-android`
+checkout; current availability and digests have not been reverified.
 
 The previous `0.1.7` candidate was retained unchanged. No usable ADB-connected
 phone was present, so overwrite installation, saved-connection preservation,

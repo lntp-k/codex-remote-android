@@ -878,3 +878,19 @@ comparison; no speedup claim is made.
   실측한 대체 수단: 기존 platform 36 및 build-tools로 빌드·단위 테스트·lint 성공.
   [추정] 컨테이너를 호스트 사용자 UID로 실행하여 이미지 SDK에 추가 설치할 수 없음.
   상태: 열림. platform-tools 및 기기 실행 환경 구성은 별도 작업이며 이 검증에서 변경하지 않음.
+
+- 일시: 2026-10-07 (Asia/Seoul). 런타임: Codex.
+  도구/훅: independent-review-record --begin / doc-claims.
+  증상(원문): `문서가 스스로 반증하는 주장을 담고 있다 — 고치고 다시 --begin 하라:`
+  `없는 폴더를 현행처럼 가리킨다: ~/coding/codex-remote-android` (APK 기록 3곳).
+  실측한 대체 수단: 검증 문서가 당시 복사 기록임을 명시하고,
+  존재하지 않는 현행 체크아웃 경로 대신 당시 저장소 내 파일명을 보존함.
+  현재 APK 존재·해시는 재검증하지 않았다고 명시; 훅·설정은 변경하지 않음.
+  [추정] 과거 경로 기록을 현행 경로 주장으로 판정한 정상 정책 차단임.
+  상태: 열림. 문서 수정 완료; 경로/시점 판정의 재발 방지는 별도 작업.
+
+Documentation-only follow-up after the successful build clarified historical
+APK-copy records in two verification documents. Kotlin source, test source,
+Gradle settings and runtime image remained unchanged; build evidence above
+is reused for those unchanged inputs. The documentation itself is checked by
+diff validation and the review recorder's document-claims check.

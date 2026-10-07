@@ -79,11 +79,15 @@ task forks.
 Release signing material was read from the existing external signing store and
 was not copied into the repository or artifact destinations.
 
-The validated release output and both retained copies were read back with the
-same SHA-256 digest shown above:
+The original validation report recorded the release output and both retained
+copies as read back with the same SHA-256 digest shown above:
 
-- `/home/jl/coding/codex-remote-android/codex-remote-android-v0.1.9.apk`
+- Repository-local copy: `codex-remote-android-v0.1.9.apk`
 - `/home/jl/mnt/dropbox-personal/codex-remote-android-v0.1.9.apk`
+
+These are historical copy records. The former `codex-remote-android` checkout
+path does not exist on this host today; current availability and digests of
+these artifacts have not been reverified.
 
 ## How to use the new controls
 
