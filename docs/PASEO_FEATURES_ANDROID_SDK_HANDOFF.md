@@ -908,3 +908,32 @@ user decisions, complete anomaly accounting and the original checkout's
 append-only notes are consolidated in [SESSION_HANDOFF_20261007.md](SESSION_HANDOFF_20261007.md).
 This closes source work on PR #4; the PR remains open and device validation is
 not claimed. Original root worktree and historical APKs are preserved.
+
+## PR #4 전체 병합 승인 — 2026-10-08
+
+사용자는 이 PR의 기존 커밋 3개가 다른 작업 대화에서 작성됐지만 모두
+이 프로젝트의 로깅·빌드·테스트 변경임을 확인한 뒤,
+"이제 남은 판단은 이 PR 전체를 병합할지이고: 승낙함."이라고 명시적으로 승인했다.
+따라서 이전 closeout의 PR 브랜치 한정 게시 경계는 이번 main 병합에 한해 해제된다.
+이 승인은 독립 검토·정확한 SHA의 internal-ci 게이트를 생략하지 않는다.
+
+- 확인한 입력: fork/main `4c7b89a6418920067cb8ca2e2ede05f094cd0e0f`,
+  PR head `3b71a9af3d695f28c7950af0d5b63ec09c07d2ce`.
+- 포함 범위: 기존 PR 커밋 `bf450ad`, `22c9d3e`, `b515186` 및
+  이번 세션의 수정·문서 커밋 `f784b66`, `e06e687`, `a50eb99`, `3b71a9a`와 이 승인 기록.
+- 방식: 별도 worktree에서 incoming SHA에 대한 최신 Sol 검토를 새로 받고,
+  로컬 main을 fast-forward한 뒤 정상 Git push로 fork/main에 게시한다.
+  GitHub UI/API merge, force push, rebase, cherry-pick, 게이트 변경을 사용하지 않는다.
+- 원래 작업 사본 `1908c079`와 미커밋 HANDOFF, 기존 APK는 보존한다.
+  실제 휴대폰 실행·설치·배포는 미검증이며 이번 승인의 수행 범위가 아니다.
+- 승인 기록 시점의 상태: 병합 예정. 완료 여부와 최종 원격 SHA는
+  이후 Git 출력·게이트 기록·PR 상태 및 최종 보고로 확인한다.
+
+| 단위 | 입력·의존 대상 | 상태·근거 | 재사용/재실행 이유 |
+| --- | --- | --- | --- |
+| 병합 범위 확정 | live fork/main, PR head, 사용자 승인 | 새로 확인: diverged commit 없음; PR 전체 병합 승인 | 이전 PR-only 게시 경계에 대한 명시적 사용자 지시 |
+| 검증·독립 검토 | 승인 기록을 더한 incoming SHA, 기존 pinned Android runtime | main 게시 범위로 검증·최신 Sol 검토 새로 수행 | 이전 Sol 승인은 main 게시를 제외했으므로 새 판정 필요 |
+| 병합·게시 | APPROVE 수령·기록, 해당 SHA의 pre-push internal-ci | fast-forward 및 정상 push 후 원격/PR 상태 확인 | 승인·CI는 재사용으로 생략하지 않음 |
+
+검증 뒤 검토, 검토 뒤 병합·push는 결과 의존 및 승인/공유 ref 쓰기 경계 때문에 순차 수행한다.
+정식 검토 에이전트 1개 사용 예정: 최신 Sol (`gpt-6.1-sol`, high), 토큰 수는 도구 미제공.
