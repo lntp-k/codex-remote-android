@@ -875,6 +875,7 @@ comparison; no speedup claim is made.
 - 일시: 2026-10-07 (Asia/Seoul). 런타임: Codex.
   도구/훅: Gradle SDK provisioning in existing runtime.
   증상(원문): `WARNING: platform-tools package is not installed, and automatic installation failed.`
+  추가 발생: 2026-10-08 main 병합 전 검증에서 동일 경고 1회; 빌드/검증은 성공.
   실측한 대체 수단: 기존 platform 36 및 build-tools로 빌드·단위 테스트·lint 성공.
   [추정] 컨테이너를 호스트 사용자 UID로 실행하여 이미지 SDK에 추가 설치할 수 없음.
   상태: 열림. platform-tools 및 기기 실행 환경 구성은 별도 작업이며 이 검증에서 변경하지 않음.
@@ -937,3 +938,13 @@ not claimed. Original root worktree and historical APKs are preserved.
 
 검증 뒤 검토, 검토 뒤 병합·push는 결과 의존 및 승인/공유 ref 쓰기 경계 때문에 순차 수행한다.
 정식 검토 에이전트 1개 사용 예정: 최신 Sol (`gpt-6.1-sol`, high), 토큰 수는 도구 미제공.
+
+병합 전 검증: `23f54e9462d5a6483d49b90ff9432031c9441fb9`에서
+위와 동일한 pinned Android runtime과 Gradle 명령을 실행해
+BUILD SUCCESSFUL (8초, 135 tasks: 5 executed / 130 up-to-date)을 확인했다.
+290개 테스트 결과 및 lint 0 오류/22 경고는 Gradle이 현행 입력을 대조해 재사용했고,
+debug·Android-test·unsigned release APK 빌드도 통과했다.
+이후 이 검증 기록만 추가했으며 Kotlin·테스트·Gradle 설정·runtime image는 바뀌지 않았다.
+신뢰된 internal-ci runner HEAD `4024cd762cf11601b0db8875731e979cecae2222`의
+registry에도 `lntp-k/codex-remote-android`가 `repository-baseline`으로 등록돼 있음을 확인했다.
+실제 main pre-push 시에는 해당 게시 SHA로 run/verify를 반드시 수행한다.
