@@ -979,6 +979,8 @@ internal fun AppUiState.withThreadArchived(threadId: String): AppUiState {
         isGoalLoading = if (archivedSelectedThread) false else isGoalLoading,
         goalError = if (archivedSelectedThread) null else goalError,
         threadTokenUsage = if (archivedSelectedThread) null else threadTokenUsage,
+        isTurnRunning = if (archivedSelectedThread) false else isTurnRunning,
+        activeTurnId = if (archivedSelectedThread) null else activeTurnId,
         timeline = if (archivedSelectedThread) emptyList() else timeline,
         olderHistoryCursor = if (archivedSelectedThread) null else olderHistoryCursor,
         hasOlderHistory = if (archivedSelectedThread) false else hasOlderHistory,

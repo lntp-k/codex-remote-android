@@ -120,6 +120,7 @@ sealed interface AppServerEvent {
         val threadId: String,
         val thread: RemoteThread?,
     ) : AppServerEvent
+    data class ThreadRemoved(val threadId: String) : AppServerEvent
     data object ThreadsChanged : AppServerEvent
     data object SkillsChanged : AppServerEvent
     data class GoalUpdated(val threadId: String, val goal: ThreadGoal) : AppServerEvent
@@ -1147,7 +1148,7 @@ class CodexRpcClient(
             "thread/started" -> _events.emit(threadStartedEvent(params))
             "thread/status/changed", "thread/archived", "thread/deleted", "thread/closed",
             "thread/name/updated", "thread/unarchived" ->
-                _events.emit(AppServerEvent.ThreadsChanged)
+                _events.emit(threadListChangeEvent(method, params))
             "skills/changed" -> _events.emit(AppServerEvent.SkillsChanged)
             "thread/goal/updated" -> {
                 val goal = params["goal"]?.let(::parseThreadGoal) ?: return
@@ -1274,6 +1275,15 @@ class CodexRpcClient(
                 turnId = turnId,
                 turnIdStatus = turnIdStatus,
             )
+        }
+
+        internal fun threadListChangeEvent(method: String, params: JsonObject): AppServerEvent {
+            // Closed means unloaded from memory, not archived or deleted.
+            if (method != "thread/archived" && method != "thread/deleted") {
+                return AppServerEvent.ThreadsChanged
+            }
+            val threadId = params.strictNonBlankString("threadId") ?: return AppServerEvent.ThreadsChanged
+            return AppServerEvent.ThreadRemoved(threadId)
         }
 
         internal fun threadStartedEvent(params: JsonObject): AppServerEvent {

@@ -948,3 +948,24 @@ debug·Android-test·unsigned release APK 빌드도 통과했다.
 신뢰된 internal-ci runner HEAD `4024cd762cf11601b0db8875731e979cecae2222`의
 registry에도 `lntp-k/codex-remote-android`가 `repository-baseline`으로 등록돼 있음을 확인했다.
 실제 main pre-push 시에는 해당 게시 SHA로 run/verify를 반드시 수행한다.
+
+
+### 도구·훅 이상 (별도 진행) — 2026-10-16 결함 수정 검증
+
+- 런타임: Codex / 고정 Android Docker 이미지의 Kotlin compile daemon.
+  증상(원문): `The daemon has terminated unexpectedly on startup attempt #1 with error code: 0. The daemon process output: 1. Kotlin compile daemon is ready`.
+  실측한 대체 수단: 같은 Gradle 실행의 자동 복구 후 compile/test까지 종료 상태 확인, BUILD SUCCESSFUL 및 테스트294개 실패0/오류0 확인.
+  [추정] 초기 daemon startup handshake 문제. 상태: 열림. 원인 조사·재발 방지는 별도 작업, daemon/훅 설정 변경 없음.
+
+
+### 두 실기기 결함 수정 및 연속5분 검증 완료 — 2026-10-16
+
+- 분리 worktree `/tmp/codex-android-device-fixes`, branch `codex/device-qa-fixes-20261016`, base1b647447. 앱 변경은 이 worktree에 보존, 미커밋·미게시. 기존 dirty 작업 사본 보존.
+- NewCommandMacro의 class/ctor/executeMacro 반사 호출 계약을 R8에서 유지. 실제 minified DEX 검사와 폰의 x² 렌더링 통과, 새 프로세스 NoSuchMethodException0.
+- 오래된/일시 누락된 목록으로 선택 세션을 지우지 않도록 수정. 최신 목록 세대만 반영. 명시적 archived/deleted 통지는 ID를 보존하여 선택·실행·권한 상태 정리, closed는 삭제로 해석하지 않음.
+- 회귀: 원래 refreshThreads로 되돌리면 selected new→null assertion 실패, 복원 후 전체294개 통과. parser3개 포함. lint오류0/경고22. 독립 소스 검토 추가 결함 없음; merge gate 승인은 아님.
+- APK0.1.11/versionCode12 설치, 신규 작업 생성→실제 응답→Send 복귀를 재선택 없이 확인. 외부 클라이언트 보관 통지도 실제 폰에서 정상 선택 해제 확인.
+- 연속5분: 300.2568초/31표본/오류0, 동일PID3188·SSH service·Dozing 유지, 재연결 요청0. 60초 뒤 보낸 실제 응답을 복귀 후 재연결/작업 재선택 없이 표시 확인. USB충전 범위; deep Doze/수시간 미검증.
+- 시험용 폰 프로필·adb reverse·서버 인증·Mac reverse·로컬 개인키 모두 제거. 원래 authorized_keys SHA복원 확인. 모든 백그라운드 작업 종료.
+- 에이전트1개, 부모 모델 상속, 토큰 도구 미제공. 수식/parser 검토 병행, 공유 소스 입력 고정 후 전체 검증. 시간 비교 기준 없어 절감 미산정.
+- 단위/입력/상태/재사용 표, 패치·red/green XML·설치APK해시·화면·31개표본·정리 증거: `/home/jl/.codex/visualizations/2026/10/15/01a13f97-4f3b-75b0-bcaf-13be07f193ea/device-fixes-20261016/REPORT.md`.

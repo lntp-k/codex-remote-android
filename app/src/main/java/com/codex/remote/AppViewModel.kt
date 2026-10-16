@@ -2784,6 +2784,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         registerStartedThread(event)
                         refreshThreads()
                     }
+                    is AppServerEvent.ThreadRemoved -> {
+                        removeRemoteThread(event.threadId)
+                        refreshThreads()
+                    }
                     AppServerEvent.ThreadsChanged -> refreshThreads()
                     AppServerEvent.SkillsChanged -> refreshComposerCatalog(forceReload = true)
                     is AppServerEvent.GoalUpdated -> if (routeSessionEvent(client, connectionGeneration, event)) {
@@ -2990,14 +2994,37 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private var threadListGeneration = 0L
+
+    private fun removeRemoteThread(threadId: String) {
+        val wasSelected = _state.value.selectedThreadId == threadId
+        if (wasSelected) {
+            releaseActiveResumeEvents()
+            sessionRequestTracker.advanceSelection()
+            sessionRegistry = sessionRegistry.clearSelection()
+        }
+        _state.update { state ->
+            val removed = state.withThreadArchived(threadId)
+            if (wasSelected) removed.copy(
+                selectedPermissionProfile = SAFE_PERMISSION_PROFILE,
+                approvalPolicy = SAFE_APPROVAL_POLICY,
+                approvalsReviewer = SAFE_APPROVALS_REVIEWER,
+            ) else removed
+        }
+        projectSessionRegistry()
+    }
+
     private fun refreshThreads() {
         val client = rpc ?: return
         if (_state.value.activeConnection == null) return
         val connectionEpoch = sessionRequestTracker.connectionGeneration
+        val listGeneration = ++threadListGeneration
         viewModelScope.launch {
             runCatching { client.listThreads() }
                 .onSuccess { threads ->
-                    if (rpc !== client || sessionRequestTracker.connectionGeneration != connectionEpoch) {
+                    if (rpc !== client || sessionRequestTracker.connectionGeneration != connectionEpoch ||
+                        listGeneration != threadListGeneration
+                    ) {
                         return@onSuccess
                     }
                     if (!captureSelectedSession()) return@onSuccess
@@ -3007,13 +3034,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             return@onSuccess
                         }
                     }
-                    val projects = groupThreadsByProject(threads)
+                    // A list snapshot can predate thread/start or its persistence. Absence is
+                    // not a deletion signal for a session we already own and selected.
+                    val selectedId = _state.value.selectedThreadId
+                    val retainedSession = selectedId?.let { sessionRegistry.sessions[it] }
+                    val retainedThread = retainedSession?.thread
+                        ?: _state.value.threads.firstOrNull { it.id == selectedId }
+                    val refreshedThreads = if (retainedSession != null && retainedThread != null &&
+                        threads.none { it.id == selectedId }
+                    ) threads + retainedThread else threads
+                    val projects = groupThreadsByProject(refreshedThreads)
                     val previousSelection = _state.value.selectionContext()
                     val refreshedProjectPath = previousSelection.projectPath
-                        ?.takeIf { path -> projects.any { it.path == path } }
+                        ?.takeIf { path -> projects.any { it.path == path } || retainedSession != null }
                         ?: projects.firstOrNull()?.path
                     val refreshedThreadId = previousSelection.threadId
-                        ?.takeIf { id -> threads.any { it.id == id } }
+                        ?.takeIf { id -> refreshedThreads.any { it.id == id } || id == retainedSession?.threadId }
                     if (previousSelection.projectPath != refreshedProjectPath ||
                         previousSelection.threadId != refreshedThreadId
                     ) {
@@ -3021,12 +3057,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     _state.update { state ->
                         val selectedPath = state.selectedProjectPath
-                            ?.takeIf { path -> projects.any { it.path == path } }
+                            ?.takeIf { path -> projects.any { it.path == path } || retainedSession != null }
                             ?: projects.firstOrNull()?.path
                         val selectedThreadId = state.selectedThreadId
-                            ?.takeIf { id -> threads.any { it.id == id } }
+                            ?.takeIf { id -> refreshedThreads.any { it.id == id } || id == retainedSession?.threadId }
                         state.copy(
-                            threads = threads,
+                            threads = refreshedThreads,
                             projects = projects,
                             selectedProjectPath = selectedPath,
                             selectedThreadId = selectedThreadId,
@@ -3034,6 +3070,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             isGoalLoading = if (selectedThreadId == null) false else state.isGoalLoading,
                             goalError = if (selectedThreadId == null) null else state.goalError,
                             threadTokenUsage = if (selectedThreadId == null) null else state.threadTokenUsage,
+                            isTurnRunning = if (selectedThreadId == null && state.selectedThreadId != null) false else state.isTurnRunning,
+                            activeTurnId = if (selectedThreadId == null && state.selectedThreadId != null) null else state.activeTurnId,
                             timeline = if (selectedThreadId == null && state.selectedThreadId != null) {
                                 emptyList()
                             } else {

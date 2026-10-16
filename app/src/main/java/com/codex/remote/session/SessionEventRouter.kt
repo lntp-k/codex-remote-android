@@ -185,6 +185,7 @@ internal object SessionEventRouter {
         }
         AppServerEvent.AccountChanged,
         is AppServerEvent.ThreadStarted,
+        is AppServerEvent.ThreadRemoved,
         AppServerEvent.ThreadsChanged,
         AppServerEvent.SkillsChanged,
         is AppServerEvent.RateLimitsUpdated,
